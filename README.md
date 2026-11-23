@@ -8,6 +8,7 @@ Site de venda de ingressos e gestão de eventos. Ele roda no GitHub Pages, e o l
 |---|---|---|
 | **Administração** | Conta marcada como `admin` no banco (passo 4 abaixo) | Cria eventos, cadastra organizadores (PF ou PJ), vincula e desvincula eventos, define a comissão da plataforma e vê tudo. |
 | **Organizador** | A administração cadastra a pessoa pelo e-mail. Quando ela cria a conta no site com esse e-mail e confirma, recebe o acesso. | Gerencia **só os eventos vinculados a ela**: informações, publicação, lotes e preços, financeiro (vendas, comissão, repasse, despesas), pedidos (com exportação CSV) e validação de entrada. Também atualiza o próprio PIX e os dados bancários. |
+| **Portaria** | O organizador cadastra a pessoa (nome e e-mail) em **Meus eventos → Equipe de portaria** e marca os eventos liberados. Ela cria a conta com esse e-mail. | Só lê o QR Code e valida ingressos dos eventos liberados, sempre do mesmo organizador. Não vê vendas, valores, despesas nem e-mails de compradores, e não altera nada. |
 | **Comprador** | Qualquer pessoa que cria conta | Compra ingressos (inteira e meia-entrada) e vê os próprios códigos em "Meus ingressos". |
 
 Quem não está logado vê a programação, mas precisa entrar para comprar.
@@ -20,6 +21,10 @@ Quem não está logado vê a programação, mas precisa entrar para comprar.
 4. O organizador cria a conta em **Entrar → Criar conta** com o mesmo e-mail e confirma pelo link. Os eventos dele aparecem em **Meus eventos**.
 
 As regras de permissão ficam no próprio banco (Row Level Security). Assim, mesmo que alguém mexa no código do navegador, um organizador não lê nem altera o evento de outro, e um comprador não vê pedidos alheios.
+
+### Atualizar o banco depois de uma nova versão
+
+Quando o arquivo `supabase/schema.sql` mudar, rode-o inteiro de novo no **SQL Editor**. Ele não apaga dados: só cria o que falta e recria regras e funções.
 
 ## Como colocar no ar
 

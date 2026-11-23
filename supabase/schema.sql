@@ -10,6 +10,9 @@
 --   organizador -> pessoa (PF ou PJ) cadastrada em "organizers" pela admin.
 --                  Quando cria a conta com o mesmo e-mail (e confirma),
 --                  fica vinculada e administra os eventos ligados a ela.
+--   portaria    -> pessoa da equipe cadastrada por um organizador ("staff").
+--                  Só lê/valida ingressos dos eventos daquele organizador
+--                  que forem liberados para ela. Não vê financeiro nem altera nada.
 --   comprador   -> qualquer conta. Compra e vê os próprios ingressos.
 -- =====================================================================
 
@@ -115,6 +118,25 @@ create table if not exists public.expenses (
 );
 create index if not exists expenses_event_idx on public.expenses (event_id);
 
+-- Equipe de portaria: cadastrada pelo organizador, só lê/valida ingressos
+create table if not exists public.staff (
+  id            uuid primary key default gen_random_uuid(),
+  organizer_id  uuid not null references public.organizers(id) on delete cascade,
+  name          text not null,
+  email         text not null,
+  user_id       uuid references auth.users(id) on delete set null,
+  created_at    timestamptz not null default now()
+);
+create unique index if not exists staff_org_email_key on public.staff (organizer_id, lower(email));
+create index if not exists staff_user_idx on public.staff (user_id);
+
+create table if not exists public.staff_events (
+  staff_id  uuid not null references public.staff(id) on delete cascade,
+  event_id  uuid not null references public.events(id) on delete cascade,
+  primary key (staff_id, event_id)
+);
+create index if not exists staff_events_event_idx on public.staff_events (event_id);
+
 -- ---------- Funções auxiliares de permissão ----------
 
 create or replace function public.is_admin() returns boolean
@@ -134,6 +156,33 @@ $$;
 create or replace function public.can_manage_event(p_event uuid) returns boolean
 language sql stable security definer set search_path = public as $$
   select public.is_admin() or public.owns_event(p_event);
+$$;
+
+-- O usuário logado é o organizador dono deste cadastro?
+create or replace function public.owns_organizer(p_org uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (select 1 from public.organizers where id = p_org and user_id = auth.uid());
+$$;
+
+-- O usuário logado é da portaria deste evento (e o evento ainda é do mesmo organizador)?
+create or replace function public.is_event_staff(p_event uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.staff_events se
+    join public.staff s on s.id = se.staff_id
+    join public.events e on e.id = se.event_id
+    where se.event_id = p_event and s.user_id = auth.uid() and e.organizer_id = s.organizer_id
+  );
+$$;
+
+-- Pode ligar este membro da portaria a este evento? Só eventos do mesmo organizador.
+create or replace function public.can_assign_staff(p_staff uuid, p_event uuid) returns boolean
+language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.staff s
+    join public.events e on e.id = p_event and e.organizer_id = s.organizer_id
+    where s.id = p_staff and (public.is_admin() or public.owns_organizer(s.organizer_id))
+  );
 $$;
 
 -- Código curto sem caracteres ambíguos (sem 0/O, 1/I)
@@ -163,6 +212,8 @@ begin
   if new.email_confirmed_at is not null then
     update public.organizers set user_id = new.id
     where lower(email) = lower(new.email) and user_id is null;
+    update public.staff set user_id = new.id
+    where lower(email) = lower(new.email) and user_id is null;
   end if;
   return new;
 end $$;
@@ -173,6 +224,8 @@ language plpgsql security definer set search_path = public as $$
 begin
   if new.email_confirmed_at is not null and old.email_confirmed_at is null then
     update public.organizers set user_id = new.id
+    where lower(email) = lower(new.email) and user_id is null;
+    update public.staff set user_id = new.id
     where lower(email) = lower(new.email) and user_id is null;
   end if;
   if new.email is distinct from old.email then
@@ -236,6 +289,47 @@ end $$;
 drop trigger if exists events_guard on public.events;
 create trigger events_guard before update on public.events
   for each row execute function public.events_guard();
+
+-- Portaria: e-mail normalizado; a conta é vinculada só pelo sistema.
+create or replace function public.staff_guard() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  new.email := lower(trim(new.email));
+  if tg_op = 'INSERT' or new.email is distinct from old.email then
+    new.user_id := (
+      select u.id from auth.users u
+      where lower(u.email) = new.email and u.email_confirmed_at is not null
+      limit 1
+    );
+    if tg_op = 'UPDATE' then
+      -- trocou o e-mail: a pessoa antiga perde o acesso aos eventos
+      delete from public.staff_events where staff_id = new.id;
+    end if;
+  elsif auth.uid() is not null then
+    new.user_id := old.user_id;
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists staff_guard on public.staff;
+create trigger staff_guard before insert or update on public.staff
+  for each row execute function public.staff_guard();
+
+-- Evento mudou de organizador: a portaria do organizador anterior perde o acesso.
+create or replace function public.events_staff_cleanup() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if new.organizer_id is distinct from old.organizer_id then
+    delete from public.staff_events se using public.staff s
+    where se.staff_id = s.id and se.event_id = new.id
+      and s.organizer_id is distinct from new.organizer_id;
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists events_staff_cleanup on public.events;
+create trigger events_staff_cleanup after update on public.events
+  for each row execute function public.events_staff_cleanup();
 
 -- ---------- Compra (atômica, com trava de lotação) ----------
 
@@ -340,7 +434,7 @@ declare
   t public.tickets%rowtype;
   o public.orders%rowtype;
 begin
-  if not public.can_manage_event(p_event) then
+  if not (public.can_manage_event(p_event) or public.is_event_staff(p_event)) then
     raise exception 'Você não tem permissão para validar ingressos deste evento.';
   end if;
   select * into t from public.tickets where code = upper(trim(p_code)) for update;
@@ -360,6 +454,26 @@ begin
                             'kind', t.kind, 'code', t.code);
 end $$;
 
+-- Contagem da entrada e últimas validações (sem e-mails nem valores)
+create or replace function public.checkin_stats(p_event uuid) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not (public.can_manage_event(p_event) or public.is_event_staff(p_event)) then
+    raise exception 'Você não tem permissão para ver a entrada deste evento.';
+  end if;
+  return jsonb_build_object(
+    'total', (select count(*) from public.tickets where event_id = p_event),
+    'used',  (select count(*) from public.tickets where event_id = p_event and checked_in_at is not null),
+    'recent', coalesce((
+      select jsonb_agg(r order by r.at desc) from (
+        select t.code, o.buyer_name as buyer, t.type_name as type, t.kind, t.checked_in_at as at
+        from public.tickets t join public.orders o on o.id = t.order_id
+        where t.event_id = p_event and t.checked_in_at is not null
+        order by t.checked_in_at desc limit 30
+      ) r), '[]'::jsonb)
+  );
+end $$;
+
 -- ---------- Regras de acesso (RLS) ----------
 
 alter table public.profiles     enable row level security;
@@ -369,6 +483,8 @@ alter table public.ticket_types enable row level security;
 alter table public.orders       enable row level security;
 alter table public.tickets      enable row level security;
 alter table public.expenses     enable row level security;
+alter table public.staff        enable row level security;
+alter table public.staff_events enable row level security;
 
 drop policy if exists profiles_select on public.profiles;
 create policy profiles_select on public.profiles for select
@@ -392,7 +508,7 @@ create policy organizers_delete on public.organizers for delete
 
 drop policy if exists events_select on public.events;
 create policy events_select on public.events for select
-  using (published or public.can_manage_event(id));
+  using (published or public.can_manage_event(id) or public.is_event_staff(id));
 drop policy if exists events_insert on public.events;
 create policy events_insert on public.events for insert
   with check (public.is_admin());
@@ -425,12 +541,37 @@ drop policy if exists expenses_all on public.expenses;
 create policy expenses_all on public.expenses for all
   using (public.can_manage_event(event_id)) with check (public.can_manage_event(event_id));
 
+drop policy if exists staff_select on public.staff;
+create policy staff_select on public.staff for select
+  using (public.is_admin() or user_id = auth.uid() or public.owns_organizer(organizer_id));
+drop policy if exists staff_write on public.staff;
+create policy staff_write on public.staff for all
+  using (public.is_admin() or public.owns_organizer(organizer_id))
+  with check (public.is_admin() or public.owns_organizer(organizer_id));
+
+drop policy if exists staff_events_select on public.staff_events;
+create policy staff_events_select on public.staff_events for select
+  using (exists (
+    select 1 from public.staff s where s.id = staff_id
+      and (public.is_admin() or s.user_id = auth.uid() or public.owns_organizer(s.organizer_id))
+  ));
+drop policy if exists staff_events_insert on public.staff_events;
+create policy staff_events_insert on public.staff_events for insert
+  with check (public.can_assign_staff(staff_id, event_id));
+drop policy if exists staff_events_delete on public.staff_events;
+create policy staff_events_delete on public.staff_events for delete
+  using (exists (
+    select 1 from public.staff s where s.id = staff_id
+      and (public.is_admin() or public.owns_organizer(s.organizer_id))
+  ));
+
 -- ---------- Privilégios por coluna ----------
 -- Pedidos e ingressos só são criados pelas funções acima; "sold" e "role"
 -- não podem ser alterados direto pelo navegador.
 
 revoke all on public.profiles, public.organizers, public.events, public.ticket_types,
-              public.orders, public.tickets, public.expenses from anon, authenticated;
+              public.orders, public.tickets, public.expenses,
+              public.staff, public.staff_events from anon, authenticated;
 
 grant select on public.events, public.ticket_types to anon, authenticated;
 grant select, update (full_name) on public.profiles to authenticated;
@@ -441,11 +582,15 @@ grant insert (id, event_id, name, price, capacity, allows_half, sort),
       delete on public.ticket_types to authenticated;
 grant select on public.orders, public.tickets to authenticated;
 grant select, insert, update, delete on public.expenses to authenticated;
+grant select, insert (id, organizer_id, name, email), update (name, email), delete on public.staff to authenticated;
+grant select, insert, delete on public.staff_events to authenticated;
 
 revoke execute on function public.buy_tickets(uuid, jsonb, text, text) from public, anon;
 grant execute on function public.buy_tickets(uuid, jsonb, text, text) to authenticated;
 revoke execute on function public.check_in(text, uuid) from public, anon;
 grant execute on function public.check_in(text, uuid) to authenticated;
+revoke execute on function public.checkin_stats(uuid) from public, anon;
+grant execute on function public.checkin_stats(uuid) to authenticated;
 
 -- ---------- Depois de criar a sua conta no site ----------
 -- Torne-se administradora rodando (troque pelo seu e-mail):

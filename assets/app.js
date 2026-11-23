@@ -100,20 +100,24 @@ function errMsg(e) {
 const must = ({ data, error }) => { if (error) throw error; return data; };
 
 /* ================= sessão ================= */
-const me = { user: null, profile: null, organizers: [] };
+const me = { user: null, profile: null, organizers: [], staff: [] };
 const isAdmin = () => me.profile?.role === 'admin';
 const isOrganizer = () => me.organizers.length > 0;
+const isStaff = () => me.staff.length > 0;
+const staffEventIds = () => [...new Set(me.staff.flatMap(s => (s.staff_events || []).map(x => x.event_id)))];
+const managesEvent = ev => isAdmin() || me.organizers.some(o => o.id === ev.organizer_id);
 
 async function loadMe(session) {
-  me.user = session?.user || null; me.profile = null; me.organizers = [];
+  me.user = session?.user || null; me.profile = null; me.organizers = []; me.staff = [];
   if (!me.user) return;
-  const [p, o] = await Promise.all([
+  const [p, o, s] = await Promise.all([
     sb.from('profiles').select('*').eq('id', me.user.id).maybeSingle(),
-    sb.from('organizers').select('*').eq('user_id', me.user.id)
+    sb.from('organizers').select('*').eq('user_id', me.user.id),
+    sb.from('staff').select('id,organizer_id,name,staff_events(event_id)').eq('user_id', me.user.id)
   ]);
-  me.profile = p.data || null; me.organizers = o.data || [];
+  me.profile = p.data || null; me.organizers = o.data || []; me.staff = s.data || [];
 }
-function homeFor() { return isAdmin() ? '#/admin' : isOrganizer() ? '#/painel' : '#/'; }
+function homeFor() { return isAdmin() ? '#/admin' : isOrganizer() ? '#/painel' : isStaff() ? '#/portaria' : '#/'; }
 
 /* ================= roteamento ================= */
 let actions = {}, forms = {}, teardown = null;
@@ -147,6 +151,7 @@ function renderNav() {
   const links = [['#/', 'Eventos']];
   if (me.user) links.push(['#/meus-ingressos', 'Meus ingressos']);
   if (isOrganizer()) links.push(['#/painel', 'Meus eventos']);
+  if (isStaff()) links.push(['#/portaria', 'Portaria']);
   if (isAdmin()) links.push(['#/admin', 'Administração']);
   const active = l => l === '#/' ? (h === '#/' || h === '#' || h.startsWith('#/evento')) : h.startsWith(l);
   $nav.innerHTML = links.map(([l, t]) => `<a class="tab" href="${l}" ${active(l) ? 'aria-current="page"' : ''}>${t}</a>`).join('') +
@@ -177,7 +182,11 @@ async function route() {
         if (!requireLogin()) return;
         if (b === 'evento') return await vManage(c, d || 'info');
         if (b === 'dados') return await vOrgData();
+        if (b === 'equipe') return await vTeam(c);
         return await vPanel();
+      case 'portaria':
+        if (!requireLogin()) return;
+        return b ? await vDoor(b) : await vDoorList();
       case 'admin':
         if (!requireLogin()) return;
         if (!isAdmin()) return vMessage('Acesso restrito', 'Esta área é só da administração.');
@@ -446,7 +455,7 @@ async function vPanel() {
   const evs = must(await sb.from('events').select(EV_PUBLIC + ',organizer_id').in('organizer_id', ids).order('starts_at', { ascending: false }));
   mount(`<div class="page-head"><div><div class="eyebrow">${esc(me.organizers.map(orgName).join(' · '))}</div><h1>Meus eventos</h1>
       <p>Edite as informações, os lotes e acompanhe vendas, despesas e entradas de cada evento.</p></div>
-      <a class="btn" href="#/painel/dados">Dados cadastrais e de recebimento</a></div>
+      <div class="row"><a class="btn" href="#/painel/equipe">Equipe de portaria</a><a class="btn" href="#/painel/dados">Dados cadastrais e de recebimento</a></div></div>
     ${evs.length ? `<div class="grid">${evs.map(ev => ticketCard(ev, `#/painel/evento/${ev.id}/info`)).join('')}</div>`
       : '<div class="empty"><h2>Nenhum evento vinculado ainda</h2><p>A administração cria o evento e o vincula a você.</p></div>'}`);
 }
@@ -494,6 +503,7 @@ async function vManage(id, tab) {
   loading();
   const ev = must(await sb.from('events').select('*, organizers(id,legal_name,trade_name,person_type,document,email,pix_key,bank_name,bank_agency,bank_account), ticket_types(*)').eq('id', id).maybeSingle());
   if (!ev) return vMessage('Evento não encontrado', 'Ele não existe ou não está vinculado à sua conta.');
+  if (!managesEvent(ev)) return go(staffEventIds().includes(ev.id) ? '#/portaria/' + ev.id : '#/');
   const admin = isAdmin();
   const back = admin ? '#/admin/eventos' : '#/painel';
   const header = `<div><a class="linkbtn" href="${back}">← ${admin ? 'Administração' : 'Meus eventos'}</a></div>
@@ -673,18 +683,20 @@ async function mOrders(ev, header) {
 }
 
 async function mCheckin(ev, header) {
-  const tickets = must(await sb.from('tickets').select('code,type_name,kind,checked_in_at,orders(buyer_name)').eq('event_id', ev.id));
+  let stats = must(await sb.rpc('checkin_stats', { p_event: ev.id }));
   let stream = null, timer = null, busy = false, last = '', lastAt = 0, detector = null, jsqr = null;
   const show = html => { const el = document.getElementById('ci-result'); if (el) el.innerHTML = html; };
   const bad = (title, text) => `<div class="result bad"><strong>${esc(title)}</strong><span>${esc(text)}</span></div>`;
   const drawStats = () => {
-    const used = tickets.filter(t => t.checked_in_at).sort((a, b) => b.checked_in_at.localeCompare(a.checked_in_at));
-    document.getElementById('ci-stats').innerHTML = `<h2>${num(used.length)} de ${num(tickets.length)} entradas</h2>
-      <div class="bar"><i style="width:${tickets.length ? Math.round(used.length / tickets.length * 100) : 0}%"></i></div>
-      ${used.length ? `<div class="tablewrap"><table><thead><tr><th>Código</th><th>Nome</th><th>Hora</th></tr></thead><tbody>
-        ${used.slice(0, 30).map(t => `<tr><td class="mono">${esc(t.code)}</td><td>${esc(t.orders?.buyer_name)}</td><td>${esc(fmtShort(t.checked_in_at))}</td></tr>`).join('')}</tbody></table></div>`
+    const el = document.getElementById('ci-stats'); if (!el) return;
+    const recent = stats.recent || [];
+    el.innerHTML = `<h2>${num(stats.used)} de ${num(stats.total)} entradas</h2>
+      <div class="bar"><i style="width:${stats.total ? Math.round(stats.used / stats.total * 100) : 0}%"></i></div>
+      ${recent.length ? `<div class="tablewrap"><table><thead><tr><th>Código</th><th>Nome</th><th>Hora</th></tr></thead><tbody>
+        ${recent.map(t => `<tr><td class="mono">${esc(t.code)}</td><td>${esc(t.buyer)}</td><td>${esc(fmtShort(t.at))}</td></tr>`).join('')}</tbody></table></div>`
       : '<p class="note">Ninguém entrou ainda.</p>'}`;
   };
+  const refreshStats = async () => { const { data } = await sb.rpc('checkin_stats', { p_event: ev.id }); if (data) { stats = data; drawStats(); } };
 
   async function validate(raw) {
     const code = normCode(raw); if (!code) return;
@@ -695,8 +707,7 @@ async function mCheckin(ev, header) {
     try { navigator.vibrate?.(ok ? 120 : [90, 60, 90, 60, 90]); } catch (_) {}
     beep(ok);
     if (ok) {
-      const t = tickets.find(x => x.code === data.code); if (t) t.checked_in_at = new Date().toISOString();
-      drawStats();
+      refreshStats();
       return show(`<div class="result ok"><strong>Entrada liberada</strong><span>${esc(data.buyer)} · ${esc(data.type)} · ${esc(data.code)}</span>${data.kind === 'meia' ? '<span><b>Meia-entrada: confira o documento.</b></span>' : ''}</div>`);
     }
     if (data?.status === 'used') return show(`<div class="result bad"><strong>Ingresso já utilizado</strong><span>${esc(data.code)} entrou em ${esc(fmtShort(data.at))} · ${esc(data.buyer)}</span></div>`);
@@ -779,6 +790,90 @@ async function mCheckin(ev, header) {
   });
   drawStats();
   teardown = stopCam;
+}
+
+/* ================= portaria ================= */
+async function vDoorList() {
+  loading();
+  const ids = staffEventIds();
+  if (!isStaff()) return vMessage('Sem acesso à portaria', 'Sua conta não faz parte de nenhuma equipe de portaria.');
+  const evs = ids.length ? must(await sb.from('events').select(EV_PUBLIC).in('id', ids).order('starts_at')) : [];
+  mount(`<div class="page-head"><div><div class="eyebrow">Equipe de portaria</div><h1>Portaria</h1>
+      <p>Escolha o evento e leia os QR Codes dos ingressos na entrada.</p></div></div>
+    ${evs.length ? `<div class="grid">${evs.map(ev => ticketCard(ev, '#/portaria/' + ev.id)).join('')}</div>`
+      : '<div class="empty"><h2>Nenhum evento liberado</h2><p>Quem organiza o evento precisa liberar você para ele.</p></div>'}`);
+}
+
+async function vDoor(id) {
+  loading();
+  const ev = must(await sb.from('events').select('id,name,starts_at,venue,city,organizer_id').eq('id', id).maybeSingle());
+  if (!ev || !(staffEventIds().includes(ev.id) || managesEvent(ev))) return vMessage('Evento não liberado', 'Você não está na portaria deste evento.');
+  const header = `<div><a class="linkbtn" href="#/portaria">← Portaria</a></div>
+    <div class="page-head"><div><div class="chips"><span class="chip accent">Portaria</span></div>
+      <h1 style="margin-top:8px">${esc(ev.name)}</h1><p>${esc(fmtLong(ev.starts_at))} · ${esc(ev.venue)}${ev.city ? ', ' + esc(ev.city) : ''}</p></div></div>`;
+  return mCheckin(ev, header);
+}
+
+/* ================= equipe de portaria (organizador / admin) ================= */
+async function vTeam(orgId) {
+  loading();
+  let org;
+  if (isAdmin() && orgId) org = must(await sb.from('organizers').select('*').eq('id', orgId).maybeSingle());
+  else org = me.organizers.find(o => !orgId || o.id === orgId);
+  if (!org) return vMessage('Sem acesso', 'Só o organizador e a administração gerenciam a equipe de portaria.');
+  const [evs, staff] = await Promise.all([
+    sb.from('events').select('id,name,starts_at').eq('organizer_id', org.id).order('starts_at', { ascending: false }).then(must),
+    sb.from('staff').select('id,name,email,user_id,staff_events(event_id)').eq('organizer_id', org.id).order('name').then(must)
+  ]);
+  const armed = new Set();
+  const back = isAdmin() && orgId ? `#/admin/organizador/${esc(org.id)}` : '#/painel';
+  const others = me.organizers.filter(o => o.id !== org.id);
+  mount(`<div><a class="linkbtn" href="${back}">← Voltar</a></div>
+  <div class="page-head"><div><div class="eyebrow">${esc(orgName(org))}</div><h1>Equipe de portaria</h1>
+    <p>Pessoas que só leem e validam ingressos nos eventos que você liberar. Elas não veem vendas, valores, e-mails de compradores nem alteram nada.</p></div>
+    ${others.length && !(isAdmin() && orgId) ? `<div class="row">${others.map(o => `<a class="btn small" href="#/painel/equipe/${esc(o.id)}">${esc(orgName(o))}</a>`).join('')}</div>` : ''}</div>
+  <form class="panel medium" data-form="add"><h2>Adicionar pessoa</h2>
+    <div class="formgrid">
+      <div class="field"><label for="st-name">Nome</label><input id="st-name" name="name" required autocomplete="off"></div>
+      <div class="field"><label for="st-email">E-mail de acesso</label><input id="st-email" name="email" type="email" required autocomplete="off"></div>
+    </div>
+    <div class="row"><button class="btn primary" type="submit">Adicionar à equipe</button>
+      <span class="note">A pessoa cria a conta no site com este mesmo e-mail. Depois de confirmar, vê só a tela de portaria.</span></div>
+  </form>
+  <div class="panel"><h2>${num(staff.length)} pessoa${staff.length === 1 ? '' : 's'} na equipe</h2>
+    ${staff.length ? staff.map(s => {
+      const on = new Set((s.staff_events || []).map(x => x.event_id));
+      return `<div class="evrow" style="display:grid;gap:10px;padding:14px 0;border-top:1px solid var(--line)">
+        <div class="row between"><div><b>${esc(s.name)}</b> ${s.user_id ? '<span class="chip ok">Conta ativa</span>' : '<span class="chip">Aguardando cadastro</span>'}<div class="note">${esc(s.email)}</div></div>
+          <button class="btn small danger" data-act="del" data-id="${esc(s.id)}">Remover da equipe</button></div>
+        ${evs.length ? `<div class="row" style="gap:6px 18px">${evs.map(e => `<label class="check"><input type="checkbox" data-change="ev" data-staff="${esc(s.id)}" data-event="${esc(e.id)}" ${on.has(e.id) ? 'checked' : ''}> ${esc(e.name)} <span class="note">${esc(fmtShort(e.starts_at))}</span></label>`).join('')}</div>`
+          : '<p class="note">Você ainda não tem eventos para liberar.</p>'}
+      </div>`;
+    }).join('') : '<p class="note">Ninguém na equipe ainda.</p>'}
+  </div>`, {
+    'change:ev': async el => {
+      el.disabled = true;
+      const { error } = el.checked
+        ? await sb.from('staff_events').insert({ staff_id: el.dataset.staff, event_id: el.dataset.event })
+        : await sb.from('staff_events').delete().eq('staff_id', el.dataset.staff).eq('event_id', el.dataset.event);
+      el.disabled = false;
+      if (error) { el.checked = !el.checked; return toast(errMsg(error), 'bad'); }
+      toast(el.checked ? 'Acesso liberado para este evento.' : 'Acesso removido deste evento.');
+    },
+    del: async b => {
+      if (!armed.has(b.dataset.id)) { armed.add(b.dataset.id); b.classList.add('armed'); b.textContent = 'Clique de novo para remover'; return; }
+      const { error } = await sb.from('staff').delete().eq('id', b.dataset.id);
+      if (error) return toast(errMsg(error), 'bad');
+      toast('Pessoa removida da equipe.'); vTeam(orgId);
+    }
+  }, {
+    add: async fd => {
+      const { data, error } = await sb.from('staff').insert({ organizer_id: org.id, name: String(fd.get('name')).trim(), email: String(fd.get('email')).trim().toLowerCase() }).select('user_id').single();
+      if (error) throw (/staff_org_email_key/.test(error.message) ? new Error('Esta pessoa já está na equipe.') : error);
+      toast(data.user_id ? 'Adicionada. Ela já tem conta: marque os eventos liberados.' : 'Adicionada. Ela terá acesso ao criar a conta com este e-mail.');
+      vTeam(orgId);
+    }
+  });
 }
 
 /* ================= administração ================= */
@@ -869,6 +964,7 @@ async function vAdminOrganizer(id) {
     <div class="row between"><button class="btn primary" type="submit">${isNew ? 'Cadastrar organizador' : 'Salvar alterações'}</button>
       ${isNew ? '' : '<button class="btn danger" type="button" data-act="del">Excluir organizador</button>'}</div>
   </form>
+  ${isNew ? '' : `<div class="row"><a class="btn" href="#/painel/equipe/${esc(o.id)}">Equipe de portaria deste organizador</a></div>`}
   ${isNew ? '' : `<div class="panel medium"><h2>Eventos vinculados</h2>
     ${mine.length ? `<div class="tablewrap"><table><tbody>${mine.map(e => `<tr><td><b>${esc(e.name)}</b><div class="note">${esc(fmtShort(e.starts_at))}</div></td><td>${e.published ? '<span class="chip ok">Publicado</span>' : '<span class="chip">Rascunho</span>'}</td>
       <td class="num"><a class="btn small" href="#/painel/evento/${esc(e.id)}/info">Gerenciar</a> <button class="btn small danger" data-act="unlink" data-id="${esc(e.id)}">Desvincular</button></td></tr>`).join('')}</tbody></table></div>`
