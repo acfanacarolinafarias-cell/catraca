@@ -194,7 +194,9 @@ create trigger on_auth_user_updated after update on auth.users
 create or replace function public.organizers_guard() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
-  if tg_op = 'UPDATE' and not public.is_admin() then
+  -- auth.uid() nulo = operação interna (confirmação de conta, SQL Editor).
+  -- Pelo site, toda alteração vem de alguém logado.
+  if tg_op = 'UPDATE' and auth.uid() is not null and not public.is_admin() then
     if new.email is distinct from old.email
        or new.person_type is distinct from old.person_type
        or new.document is distinct from old.document
@@ -222,7 +224,7 @@ create trigger organizers_guard before insert or update on public.organizers
 create or replace function public.events_guard() returns trigger
 language plpgsql security definer set search_path = public as $$
 begin
-  if not public.is_admin() then
+  if auth.uid() is not null and not public.is_admin() then
     if new.organizer_id is distinct from old.organizer_id
        or new.platform_pct is distinct from old.platform_pct then
       raise exception 'Somente a administração altera o organizador e a comissão da plataforma.';
