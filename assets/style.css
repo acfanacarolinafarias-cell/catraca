@@ -148,9 +148,24 @@ main.wrap { padding-block: 28px 72px; display: grid; gap: 24px; }
 
 /* Ingressos emitidos */
 .passes { display: grid; gap: 10px; }
-.pass { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 14px 16px; border-radius: 12px; border: 1px dashed var(--line); background: var(--surface-2); }
+.pass { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 16px; align-items: center; padding: 14px 16px; border-radius: 12px; border: 1px dashed var(--line); background: var(--surface-2); }
+.pass-info { display: grid; gap: 6px; justify-items: start; min-width: 0; }
 .code { font-family: var(--font-mono); font-weight: 700; letter-spacing: 0.06em; }
-.pass .code { font-size: 1.05rem; }
+.pass .code { font-size: 1.1rem; }
+/* QR sempre escuro sobre branco, nos dois temas, para a câmera ler */
+.qr { width: 120px; aspect-ratio: 1; padding: 8px; background: #FFFFFF; border: 1px solid var(--line); border-radius: 10px; cursor: zoom-in; display: block; }
+.qr span, .qr svg { display: block; width: 100%; height: 100%; }
+.pass.used .qr { opacity: 0.3; }
+.qr-zoom { position: fixed; inset: 0; z-index: 30; background: rgb(0 0 0 / 0.82); display: grid; place-items: center; padding: 16px; }
+.qr-zoom-card { background: #FFFFFF; color: #121A33; border-radius: 18px; padding: 22px; display: grid; gap: 10px; justify-items: center; width: min(92vw, 420px); }
+.qr-zoom-card .note { color: #59627E; }
+.qr-big { width: 100%; aspect-ratio: 1; }
+.qr-big svg { width: 100%; height: 100%; display: block; }
+.qr-zoom-card .code { font-size: 1.4rem; }
+.scanner { position: relative; width: 100%; aspect-ratio: 1; max-height: 62vh; border-radius: 14px; overflow: hidden; background: #000; }
+.scanner video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.scanner .aim { position: absolute; inset: 16%; border: 3px solid rgb(255 255 255 / 0.9); border-radius: 18px; box-shadow: 0 0 0 999px rgb(0 0 0 / 0.35); }
+.result.wait { background: var(--accent-soft); color: var(--ink); }
 
 /* Painéis */
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
@@ -180,3 +195,5 @@ details.panel summary { cursor: pointer; font-family: var(--font-display); font-
 #toast .t { padding: 11px 14px; border-radius: 10px; background: var(--ink); color: var(--surface); font-weight: 500; box-shadow: 0 8px 24px rgb(0 0 0 / 0.18); }
 #toast .t.bad { background: var(--bad); }
 @media (prefers-reduced-motion: reduce) { .ticket { transition: none; } .ticket:hover { transform: none; } }
+.pass-info .chip { white-space: normal; text-align: left; max-width: 100%; }
+@media (max-width: 420px) { .qr { width: 100px; padding: 6px; } .pass { gap: 12px; padding: 12px; } }

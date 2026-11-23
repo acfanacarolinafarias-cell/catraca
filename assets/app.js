@@ -41,6 +41,40 @@ function fmtDoc(type, v) {
 }
 const orgName = o => o ? (o.trade_name || o.legal_name) : '';
 
+/* ---------- QR Code ---------- */
+const loadScript = (src, name) => window[name] ? Promise.resolve(window[name]) : new Promise((res, rej) => {
+  const s = document.createElement('script'); s.src = src;
+  s.onload = () => res(window[name]); s.onerror = () => rej(new Error('Não foi possível carregar o leitor de QR Code. Verifique a conexão.'));
+  document.head.append(s);
+});
+const CODE_RE = /[A-HJ-NP-Z2-9]{6}-\d{1,3}/;
+const normCode = raw => { const s = String(raw || '').toUpperCase().replace(/\s+/g, ''); const m = s.match(CODE_RE); return m ? m[0] : s; };
+function qrSvg(qrcode, text) { const q = qrcode(0, 'M'); q.addData(text); q.make(); return q.createSvgTag({ cellSize: 4, margin: 0, scalable: true }); }
+async function drawQRs() {
+  const els = $app.querySelectorAll('[data-qr]'); if (!els.length) return;
+  try { const qrcode = await loadScript('assets/vendor/qrcode.js', 'qrcode'); els.forEach(el => { el.innerHTML = qrSvg(qrcode, el.dataset.qr); }); }
+  catch (_) { els.forEach(el => { el.hidden = true; }); }
+}
+// Toque no QR: abre ampliado (ajuda na leitura na porta)
+document.addEventListener('click', async e => {
+  const z = e.target.closest('[data-zoom]');
+  if (z) {
+    const qrcode = await loadScript('assets/vendor/qrcode.js', 'qrcode').catch(() => null); if (!qrcode) return;
+    const ov = document.createElement('div'); ov.className = 'qr-zoom'; ov.setAttribute('role', 'dialog'); ov.setAttribute('aria-label', 'QR Code ampliado');
+    ov.innerHTML = `<div class="qr-zoom-card"><div class="qr-big">${qrSvg(qrcode, z.dataset.zoom)}</div><div class="code">${esc(z.dataset.zoom)}</div><p class="note">Toque em qualquer lugar para fechar</p></div>`;
+    ov.addEventListener('click', () => ov.remove()); document.body.append(ov);
+  }
+});
+let audioCtx = null;
+function beep(ok) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = ok ? 'sine' : 'square'; o.frequency.value = ok ? 880 : 220; g.gain.value = 0.08;
+    o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime + (ok ? 0.15 : 0.45));
+  } catch (_) {}
+}
+
 function toast(msg, kind = 'ok') {
   const box = document.getElementById('toast');
   const el = document.createElement('div'); el.className = 't ' + kind; el.textContent = msg;
@@ -82,7 +116,7 @@ async function loadMe(session) {
 function homeFor() { return isAdmin() ? '#/admin' : isOrganizer() ? '#/painel' : '#/'; }
 
 /* ================= roteamento ================= */
-let actions = {}, forms = {};
+let actions = {}, forms = {}, teardown = null;
 function mount(html, a = {}, f = {}) { $app.innerHTML = html; actions = a; forms = f; }
 const loading = () => mount('<p class="note">Carregando…</p>');
 const go = h => { if (location.hash === h) route(); else location.hash = h; };
@@ -125,6 +159,7 @@ $nav.addEventListener('click', async e => {
 });
 
 async function route() {
+  if (teardown) { try { teardown(); } catch (_) {} teardown = null; }
   renderNav();
   if (!configured) return vSetup();
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
@@ -305,8 +340,11 @@ async function vEvent(id) {
 
 function passList(tickets) {
   return `<div class="passes">${[...(tickets || [])].sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true })).map(t => `
-    <div class="pass"><div><div class="code">${esc(t.code)}</div><div class="note">${esc(t.type_name)}${t.kind === 'meia' ? ' · Meia-entrada' : ''}</div></div>
-    ${t.checked_in_at ? `<span class="chip">Utilizado ${esc(fmtShort(t.checked_in_at))}</span>` : '<span class="chip ok">Válido</span>'}</div>`).join('')}</div>`;
+    <div class="pass ${t.checked_in_at ? 'used' : ''}">
+      <button class="qr" type="button" data-zoom="${esc(t.code)}" aria-label="Ampliar QR Code do ingresso ${esc(t.code)}"><span data-qr="${esc(t.code)}"></span></button>
+      <div class="pass-info"><div class="code">${esc(t.code)}</div><div class="note">${esc(t.type_name)}${t.kind === 'meia' ? ' · Meia-entrada (leve documento)' : ''}</div>
+      ${t.checked_in_at ? `<span class="chip">Utilizado ${esc(fmtShort(t.checked_in_at))}</span>` : '<span class="chip ok">Válido · toque no QR para ampliar</span>'}</div>
+    </div>`).join('')}</div>`;
 }
 
 const ORDER_FIELDS = 'id,code,subtotal,fee,total,created_at,buyer_name,events(id,name,starts_at,venue,city),tickets(code,type_name,kind,checked_in_at)';
@@ -322,6 +360,7 @@ async function vOrder(id) {
     ${passList(o.tickets)}
     <div class="row"><a class="btn" href="#/meus-ingressos">Ver todos os meus ingressos</a><a class="btn" href="#/evento/${esc(o.events?.id)}">Comprar mais</a></div>
   </div>`);
+  drawQRs();
 }
 
 async function vMyTickets() {
@@ -333,6 +372,7 @@ async function vMyTickets() {
     <div class="row between"><h2>${esc(o.events?.name)}</h2><span class="note mono">Pedido ${esc(o.code)}</span></div>
     <p class="note">${esc(fmtLong(o.events?.starts_at))} · ${esc(o.events?.venue || '')} · ${money(o.total)}</p>
     ${passList(o.tickets)}</div>`).join(''));
+  drawQRs();
 }
 
 /* ================= login ================= */
@@ -634,35 +674,111 @@ async function mOrders(ev, header) {
 
 async function mCheckin(ev, header) {
   const tickets = must(await sb.from('tickets').select('code,type_name,kind,checked_in_at,orders(buyer_name)').eq('event_id', ev.id));
-  const used = tickets.filter(t => t.checked_in_at).sort((a, b) => b.checked_in_at.localeCompare(a.checked_in_at));
-  const draw = (result = '') => mount(header + `<div class="two">
-    <form class="panel" data-form="check"><h2>Validar ingresso</h2>
-      <p class="note">Digite o código que a pessoa apresentou. Cada código só entra uma vez.</p>
-      <input id="code" name="code" class="input big-input" placeholder="ABC123-1" autocomplete="off" autocapitalize="characters" required>
-      <button class="btn primary" type="submit">Validar entrada</button>
-      ${result}
-    </form>
-    <div class="panel"><h2>${num(used.length)} de ${num(tickets.length)} entradas</h2>
+  let stream = null, timer = null, busy = false, last = '', lastAt = 0, detector = null, jsqr = null;
+  const show = html => { const el = document.getElementById('ci-result'); if (el) el.innerHTML = html; };
+  const bad = (title, text) => `<div class="result bad"><strong>${esc(title)}</strong><span>${esc(text)}</span></div>`;
+  const drawStats = () => {
+    const used = tickets.filter(t => t.checked_in_at).sort((a, b) => b.checked_in_at.localeCompare(a.checked_in_at));
+    document.getElementById('ci-stats').innerHTML = `<h2>${num(used.length)} de ${num(tickets.length)} entradas</h2>
       <div class="bar"><i style="width:${tickets.length ? Math.round(used.length / tickets.length * 100) : 0}%"></i></div>
       ${used.length ? `<div class="tablewrap"><table><thead><tr><th>Código</th><th>Nome</th><th>Hora</th></tr></thead><tbody>
         ${used.slice(0, 30).map(t => `<tr><td class="mono">${esc(t.code)}</td><td>${esc(t.orders?.buyer_name)}</td><td>${esc(fmtShort(t.checked_in_at))}</td></tr>`).join('')}</tbody></table></div>`
-      : '<p class="note">Ninguém entrou ainda.</p>'}
-    </div></div>`, {}, {
-    check: async fd => {
-      const { data, error } = await sb.rpc('check_in', { p_code: String(fd.get('code')), p_event: ev.id });
-      if (error) throw error;
-      const code = String(fd.get('code')).trim().toUpperCase();
-      let html;
-      if (data.status === 'ok') {
-        const t = tickets.find(x => x.code === data.code); if (t) { t.checked_in_at = new Date().toISOString(); used.unshift(t); }
-        html = `<div class="result ok"><strong>Entrada liberada</strong><span>${esc(data.buyer)} · ${esc(data.type)}</span>${data.kind === 'meia' ? '<span><b>Meia-entrada: confira o documento.</b></span>' : ''}</div>`;
-      } else if (data.status === 'used') html = `<div class="result bad"><strong>Ingresso já utilizado</strong><span>${esc(data.code)} entrou em ${esc(fmtShort(data.at))} · ${esc(data.buyer)}</span></div>`;
-      else if (data.status === 'other_event') html = `<div class="result bad"><strong>Ingresso de outro evento</strong><span>${esc(code)} não vale para ${esc(ev.name)}.</span></div>`;
-      else html = `<div class="result bad"><strong>Código não encontrado</strong><span>Confira os caracteres de ${esc(code)}. Os códigos não usam 0, O, 1 nem I.</span></div>`;
-      draw(html); document.getElementById('code')?.focus();
+      : '<p class="note">Ninguém entrou ainda.</p>'}`;
+  };
+
+  async function validate(raw) {
+    const code = normCode(raw); if (!code) return;
+    show(`<div class="result wait"><strong>Validando ${esc(code)}…</strong></div>`);
+    const { data, error } = await sb.rpc('check_in', { p_code: code, p_event: ev.id });
+    if (error) { beep(false); return show(bad('Não foi possível validar', errMsg(error))); }
+    const ok = data?.status === 'ok';
+    try { navigator.vibrate?.(ok ? 120 : [90, 60, 90, 60, 90]); } catch (_) {}
+    beep(ok);
+    if (ok) {
+      const t = tickets.find(x => x.code === data.code); if (t) t.checked_in_at = new Date().toISOString();
+      drawStats();
+      return show(`<div class="result ok"><strong>Entrada liberada</strong><span>${esc(data.buyer)} · ${esc(data.type)} · ${esc(data.code)}</span>${data.kind === 'meia' ? '<span><b>Meia-entrada: confira o documento.</b></span>' : ''}</div>`);
     }
+    if (data?.status === 'used') return show(`<div class="result bad"><strong>Ingresso já utilizado</strong><span>${esc(data.code)} entrou em ${esc(fmtShort(data.at))} · ${esc(data.buyer)}</span></div>`);
+    if (data?.status === 'other_event') return show(bad('Ingresso de outro evento', `${code} não vale para ${ev.name}.`));
+    show(bad('Código não encontrado', `Confira os caracteres de ${code}. Os códigos não usam 0, O, 1 nem I.`));
+  }
+
+  function stopCam() {
+    clearTimeout(timer); timer = null;
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    const sc = document.getElementById('scanner'); if (sc) sc.hidden = true;
+    const b = document.getElementById('cam-btn'); if (b) b.textContent = 'Escanear QR Code';
+  }
+  async function startCam() {
+    beep(true); // libera o som no navegador a partir deste toque
+    if (!navigator.mediaDevices?.getUserMedia) return show(bad('Câmera indisponível', 'Este navegador não permite usar a câmera. Use Chrome ou Safari atualizados, ou digite o código.'));
+    try {
+      if (!detector && 'BarcodeDetector' in window) {
+        try { if ((await BarcodeDetector.getSupportedFormats()).includes('qr_code')) detector = new BarcodeDetector({ formats: ['qr_code'] }); } catch (_) {}
+      }
+      if (!detector && !jsqr) { const g = await loadScript('assets/vendor/jsQR.js', 'jsQR'); jsqr = g.default || g; }
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    } catch (e) {
+      const msg = e?.name === 'NotAllowedError' ? 'Permita o acesso à câmera no navegador (ícone de cadeado ao lado do endereço) e tente de novo.'
+        : e?.name === 'NotFoundError' ? 'Nenhuma câmera encontrada neste aparelho.' : errMsg(e);
+      return show(bad('Não foi possível abrir a câmera', msg));
+    }
+    const video = document.getElementById('cam');
+    if (!video) return stopCam();
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    document.getElementById('scanner').hidden = false;
+    document.getElementById('cam-btn').textContent = 'Fechar câmera';
+    show('<div class="result wait"><strong>Aponte para o QR Code do ingresso</strong></div>');
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const tick = async () => {
+      if (!stream) return;
+      if (!busy && video.readyState >= 2 && video.videoWidth) {
+        let text = '';
+        try {
+          if (detector) text = (await detector.detect(video))[0]?.rawValue || '';
+          else {
+            const s = Math.min(1, 720 / Math.max(video.videoWidth, video.videoHeight));
+            canvas.width = Math.round(video.videoWidth * s); canvas.height = Math.round(video.videoHeight * s);
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            text = jsqr(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' })?.data || '';
+          }
+        } catch (_) {}
+        const code = text && normCode(text);
+        if (code && !(code === last && Date.now() - lastAt < 4000)) {
+          last = code; lastAt = Date.now(); busy = true;
+          await validate(code);
+          setTimeout(() => { busy = false; }, 1500);
+        }
+      }
+      timer = setTimeout(tick, 160);
+    };
+    tick();
+  }
+
+  mount(header + `<div class="two">
+    <div class="panel"><h2>Validar ingresso</h2>
+      <div class="scanner" id="scanner" hidden><video id="cam" playsinline muted></video><div class="aim" aria-hidden="true"></div></div>
+      <button class="btn primary" type="button" data-act="cam" id="cam-btn">Escanear QR Code</button>
+      <div id="ci-result"></div>
+      <form data-form="check" class="row">
+        <input id="code" name="code" class="input big-input" style="flex:1;min-width:0" placeholder="ABC234-1" autocomplete="off" autocapitalize="characters" aria-label="Código do ingresso" required>
+        <button class="btn" type="submit">Validar código</button>
+      </form>
+      <p class="note">Sem câmera? Digite o código que aparece embaixo do QR. Cada ingresso só entra uma vez.</p>
+    </div>
+    <div class="panel" id="ci-stats"></div>
+  </div>`, {
+    cam: () => (stream ? stopCam() : startCam())
+  }, {
+    check: async (fd, f) => { await validate(fd.get('code')); f.reset(); }
   });
-  draw(); document.getElementById('code')?.focus();
+  drawStats();
+  teardown = stopCam;
 }
 
 /* ================= administração ================= */
