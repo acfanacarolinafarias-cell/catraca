@@ -952,6 +952,11 @@ revoke execute on function public.release_order_seats(uuid) from public, anon, a
 revoke execute on function public.payment_fee_for(numeric, text) from public, anon, authenticated;
 grant execute on function public.confirm_payment(text, text) to service_role;
 grant execute on function public.fail_payment(text, text, text) to service_role;
+-- O que as Edge Functions (checkout e payment-webhook) leem e gravam com a chave de servidor.
+-- Projetos novos do Supabase não dão acesso automático às tabelas para service_role.
+grant select, update on public.orders to service_role;
+grant select on public.events, public.organizers, public.settings to service_role;
+grant execute on function public.release_expired(uuid) to service_role;
 revoke execute on function public.check_in(text, uuid) from public, anon;
 grant execute on function public.check_in(text, uuid) to authenticated;
 revoke execute on function public.checkin_stats(uuid) from public, anon;
