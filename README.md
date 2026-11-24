@@ -98,6 +98,14 @@ supabase/functions/_shared/providers  um arquivo por meio de pagamento (asaas.ts
 
 Webhook no Asaas (Integrações → Webhooks): URL `https://xfrbybveoschauaaxmbk.supabase.co/functions/v1/payment-webhook?provider=asaas`, eventos de **cobrança** (PAYMENT_CONFIRMED, PAYMENT_RECEIVED, PAYMENT_OVERDUE, PAYMENT_DELETED, PAYMENT_REFUNDED).
 
+## Cupons de desconto
+
+O organizador (ou a administração) cria cupons em **Gerenciar evento → Cupons**. Quem cria escolhe o tipo (% ou R$ fixo por ingresso), os lotes (nenhum = todos), se vale para meia-entrada, o limite de usos, se é uma vez por pessoa e a validade.
+
+- O desconto sai **só da parte do organizador**. A taxa de serviço e a cobrança da plataforma continuam sobre o preço cheio.
+- O banco recusa um cupom que deixaria a parte do organizador abaixo da cobrança da plataforma (ex.: 100%).
+- Reserva que expira sem pagamento devolve o uso do cupom.
+
 ## Dinheiro: como os valores são calculados
 
 - **Preço da meia-entrada** = metade da inteira; ela usa a mesma lotação do lote.

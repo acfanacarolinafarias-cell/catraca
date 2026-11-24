@@ -299,18 +299,27 @@ async function vEvent(id) {
   const types = sortTypes(ev.ticket_types);
   const cart = {};
   let method = 'pix';
+  let coupon = null;
   const past = isPast(ev);
+  // Desconto de um ingresso (mesma regra do banco: coupon_ticket_discount)
+  const ticketDiscount = (t, kind, unit) => {
+    if (!coupon) return 0;
+    if (coupon.ticket_type_ids && !coupon.ticket_type_ids.includes(t.id)) return 0;
+    if (kind === 'meia' && !coupon.include_half) return 0;
+    return coupon.type === 'percent' ? Math.round(unit * Number(coupon.value)) / 100 : Math.min(Number(coupon.value), unit);
+  };
   const inCart = tid => (cart[tid + '|inteira'] || 0) + (cart[tid + '|meia'] || 0);
   const lines = () => {
     const out = [];
     for (const t of types) for (const kind of ['inteira', 'meia']) {
       const q = cart[t.id + '|' + kind] || 0;
-      if (q) out.push({ t, kind, qty: q, unit: kind === 'meia' ? half(t.price) : Number(t.price) });
+      if (q) { const unit = kind === 'meia' ? half(t.price) : Number(t.price); out.push({ t, kind, qty: q, unit, disc: ticketDiscount(t, kind, unit) }); }
     }
     const subtotal = out.reduce((a, l) => a + l.unit * l.qty, 0);
-    const fee = Math.round(subtotal * Number(ev.fee_pct)) / 100;
-    const pfee = payFee(subtotal + fee, method, cfg);
-    return { out, subtotal, fee, pfee, total: subtotal + fee + pfee, count: out.reduce((a, l) => a + l.qty, 0) };
+    const discount = Math.round(out.reduce((a, l) => a + l.disc * l.qty, 0) * 100) / 100;
+    const fee = Math.round(subtotal * Number(ev.fee_pct)) / 100;   // taxa de serviço sobre o preço cheio
+    const pfee = payFee(subtotal - discount + fee, method, cfg);
+    return { out, subtotal, discount, fee, pfee, total: subtotal - discount + fee + pfee, count: out.reduce((a, l) => a + l.qty, 0) };
   };
 
   const drawLots = () => {
@@ -329,12 +338,13 @@ async function vEvent(id) {
     const c = lines();
     document.getElementById('summary').innerHTML = c.count
       ? `<div class="sum">${c.out.map(l => `<div><span>${l.qty}× ${esc(l.t.name)}${l.kind === 'meia' ? ' (meia)' : ''}</span><span>${money(l.unit * l.qty)}</span></div>`).join('')}
+        ${coupon ? `<div style="color:var(--ok)"><span>Cupom ${esc(coupon.code)}</span><span>${c.discount ? '−' + money(c.discount) : 'não vale para estes ingressos'}</span></div>` : ''}
         <div class="note"><span>Taxa de serviço (${num(ev.fee_pct)}%)</span><span>${money(c.fee)}</span></div>
         ${online && c.pfee ? `<div class="note"><span>Taxa do ${method === 'pix' ? 'Pix' : 'cartão'}</span><span>${money(c.pfee)}</span></div>` : ''}
         <div class="total"><span>Total</span><span>${money(c.total)}</span></div></div>`
       : '<p class="note">Adicione ingressos para ver o total.</p>';
     if (online) {
-      const base = c.subtotal + c.fee;
+      const base = c.subtotal - c.discount + c.fee;
       document.querySelectorAll('[data-method-total]').forEach(el => {
         el.textContent = c.count ? money(base + payFee(base, el.dataset.methodTotal, cfg)) : '';
       });
@@ -363,6 +373,8 @@ async function vEvent(id) {
         : me.user ? `<form data-form="buy" class="panel" style="padding:0;border:0">
           <div class="field"><label for="buyer-name">Nome no ingresso</label><input id="buyer-name" name="name" required autocomplete="name" value="${esc(me.profile?.full_name || '')}"></div>
           <div class="field"><label for="buyer-email">E-mail para contato</label><input id="buyer-email" name="email" type="email" autocomplete="email" value="${esc(me.user.email)}"></div>
+          <div class="field"><label for="coupon-code">Cupom de desconto</label>
+            <div class="row" id="coupon-box"><input id="coupon-code" class="input" autocomplete="off" autocapitalize="characters" placeholder="Se tiver, digite aqui" style="flex:1;min-width:0"><button class="btn" type="button" data-act="coupon">Aplicar</button></div></div>
           ${online ? `
           <div class="field"><span class="label">Forma de pagamento</span>
             <div class="paychoice">
@@ -382,6 +394,18 @@ async function vEvent(id) {
     dec: b => { cart[b.dataset.k] = Math.max(0, (cart[b.dataset.k] || 0) - 1); drawLots(); drawSummary(); },
     login: () => requireLogin(),
     'change:method': el => { method = el.value; drawSummary(); },
+    coupon: async () => {
+      const box = document.getElementById('coupon-box');
+      if (coupon) { coupon = null; box.innerHTML = '<input id="coupon-code" class="input" autocomplete="off" autocapitalize="characters" placeholder="Se tiver, digite aqui" style="flex:1;min-width:0"><button class="btn" type="button" data-act="coupon">Aplicar</button>'; return drawSummary(); }
+      const code = document.getElementById('coupon-code').value.trim();
+      if (!code) return;
+      const { data, error } = await sb.rpc('check_coupon', { p_event: ev.id, p_code: code });
+      if (error) return toast(errMsg(error), 'bad');
+      coupon = data;
+      box.innerHTML = `<span class="chip ok" style="align-self:center">Cupom ${esc(data.code)}: ${data.type === 'percent' ? num(data.value) + '%' : money(data.value) + ' por ingresso'}</span><button class="btn small" type="button" data-act="coupon">Remover</button>`;
+      drawSummary();
+      if (!lines().discount && lines().count) toast('O cupom foi aplicado, mas não vale para os ingressos escolhidos.', 'bad');
+    },
     'input:doc': el => { const d = digits(el.value).slice(0, 14); el.value = d.length === 11 ? fmtDoc('PF', d) : d.length === 14 ? fmtDoc('PJ', d) : d; }
   }, {
     buy: async fd => {
@@ -389,7 +413,7 @@ async function vEvent(id) {
       const doc = digits(fd.get('document'));
       if (online && !(doc.length === 11 ? validCPF(doc) : doc.length === 14 ? validCNPJ(doc) : false)) return toast('CPF inválido. Confira os números.', 'bad');
       const items = c.out.map(l => ({ type_id: l.t.id, kind: l.kind, qty: l.qty }));
-      const { data, error } = await sb.rpc('buy_tickets', { p_event: ev.id, p_items: items, p_buyer_name: String(fd.get('name') || '').trim(), p_buyer_email: String(fd.get('email') || '').trim(), p_method: online ? method : null });
+      const { data, error } = await sb.rpc('buy_tickets', { p_event: ev.id, p_items: items, p_buyer_name: String(fd.get('name') || '').trim(), p_buyer_email: String(fd.get('email') || '').trim(), p_method: online ? method : null, p_coupon: coupon ? coupon.code : null });
       if (error) { toast(errMsg(error), 'bad'); return vEvent(id); }
       if (online) { try { sessionStorage.setItem('doc:' + data, doc); } catch (_) {} }
       go((online ? '#/pagamento/' : '#/pedido/') + data);
@@ -439,7 +463,7 @@ async function invokeFn(name, body) {
 
 async function vPay(id) {
   loading();
-  const FIELDS = 'id,code,status,expires_at,payment_method,subtotal,fee,payment_fee,total,provider_data,events(id,name,starts_at)';
+  const FIELDS = 'id,code,status,expires_at,payment_method,subtotal,discount,coupon_code,fee,payment_fee,total,provider_data,events(id,name,starts_at)';
   let o = must(await sb.from('orders').select(FIELDS).eq('id', id).maybeSingle());
   if (!o) return vMessage('Pedido não encontrado', 'Confira em “Meus ingressos”.');
   if (o.status === 'confirmed') return go('#/pedido/' + id);
@@ -453,7 +477,7 @@ async function vPay(id) {
       <a class="btn primary" href="#/evento/${esc(o.events?.id)}">Voltar ao evento</a></div>`);
   }
   const card = o.payment_method === 'card';
-  const summary = `<div class="sum"><div><span>Ingressos</span><span>${money(o.subtotal)}</span></div><div class="note"><span>Taxa de serviço</span><span>${money(o.fee)}</span></div>
+  const summary = `<div class="sum"><div><span>Ingressos</span><span>${money(o.subtotal)}</span></div>${Number(o.discount) ? `<div style="color:var(--ok)"><span>Cupom ${esc(o.coupon_code)}</span><span>−${money(o.discount)}</span></div>` : ''}<div class="note"><span>Taxa de serviço</span><span>${money(o.fee)}</span></div>
     ${Number(o.payment_fee) ? `<div class="note"><span>Taxa do ${card ? 'cartão' : 'Pix'}</span><span>${money(o.payment_fee)}</span></div>` : ''}
     <div class="total"><span>Total</span><span>${money(o.total)}</span></div></div>`;
   const tick = () => {
@@ -667,7 +691,7 @@ function orgEditableFields(o = {}) {
 const orgEditablePayload = fd => ({ ...Object.fromEntries(['trade_name', 'phone', 'pix_key', 'bank_name', 'bank_agency', 'bank_account', 'payout_account'].map(k => [k, String(fd.get(k) || '').trim()])), payout_provider: 'asaas' });
 
 /* ================= gestão de um evento (organizador e admin) ================= */
-const MANAGE_TABS = [['info', 'Informações'], ['lotes', 'Lotes'], ['financeiro', 'Financeiro'], ['pedidos', 'Pedidos'], ['entrada', 'Entrada']];
+const MANAGE_TABS = [['info', 'Informações'], ['lotes', 'Lotes'], ['cupons', 'Cupons'], ['financeiro', 'Financeiro'], ['pedidos', 'Pedidos'], ['entrada', 'Entrada']];
 
 async function vManage(id, tab) {
   loading();
@@ -683,6 +707,7 @@ async function vManage(id, tab) {
     <nav class="subtabs">${MANAGE_TABS.map(([k, t]) => `<a href="#/painel/evento/${esc(ev.id)}/${k}" ${k === tab ? 'aria-current="page"' : ''}>${t}</a>`).join('')}</nav>`;
   const reload = () => vManage(id, tab);
   if (tab === 'lotes') return mLotes(ev, header, reload);
+  if (tab === 'cupons') return mCoupons(ev, header, reload);
   if (tab === 'financeiro') return mFinance(ev, header, reload);
   if (tab === 'pedidos') return mOrders(ev, header);
   if (tab === 'entrada') return mCheckin(ev, header);
@@ -763,13 +788,80 @@ function mLotes(ev, header, reload) {
   });
 }
 
+async function mCoupons(ev, header, reload) {
+  const [coupons, orders] = await Promise.all([
+    sb.from('coupons').select('*').eq('event_id', ev.id).order('created_at', { ascending: false }).then(must),
+    sb.from('orders').select('coupon_id,status,discount').eq('event_id', ev.id).not('coupon_id', 'is', null).then(must)
+  ]);
+  const types = sortTypes(ev.ticket_types);
+  const typeName = id => types.find(t => t.id === id)?.name || 'lote removido';
+  const uses = id => orders.filter(o => o.coupon_id === id && (o.status === 'confirmed' || o.status === 'pending')).length;
+  const given = id => orders.filter(o => o.coupon_id === id && o.status === 'confirmed').reduce((a, o) => a + Number(o.discount), 0);
+  const armed = new Set();
+  const state = c => !c.active ? ['Desativado', ''] : c.valid_until && new Date(c.valid_until) < new Date() ? ['Expirado', 'bad'] : c.max_uses && uses(c.id) >= c.max_uses ? ['Esgotado', 'bad'] : ['Ativo', 'ok'];
+  mount(header + `
+  <form class="panel medium" data-form="new"><div><h2>Novo cupom</h2>
+    <p class="note">O desconto sai da parte de quem organiza: a taxa de serviço e a cobrança da plataforma continuam calculadas sobre o preço cheio.</p></div>
+    <div class="formgrid">
+      <div class="field"><label for="cp-code">Código</label><input id="cp-code" name="code" required maxlength="30" autocomplete="off" autocapitalize="characters" placeholder="AMIGOS20" data-input="cpcode"></div>
+      <div class="field"><label for="cp-type">Tipo de desconto</label><select id="cp-type" name="discount_type"><option value="percent">Percentual (%)</option><option value="fixed">Valor fixo por ingresso (R$)</option></select></div>
+      <div class="field"><label for="cp-value">Desconto</label><input id="cp-value" name="discount_value" type="number" min="0.01" step="0.01" required placeholder="20"></div>
+      <div class="field"><label for="cp-until">Válido até (opcional)</label><input id="cp-until" name="valid_until" type="datetime-local"></div>
+      <div class="field"><label for="cp-max">Limite de usos (opcional)</label><input id="cp-max" name="max_uses" type="number" min="1" step="1" placeholder="Sem limite"></div>
+      <div class="field" style="align-content:end"><label class="check"><input type="checkbox" name="once_per_buyer"> Cada pessoa usa só uma vez</label></div>
+      <div class="field full"><span class="label">Vale para quais lotes (nenhum marcado = todos)</span>
+        <div class="row" style="gap:6px 18px">${types.map(t => `<label class="check"><input type="checkbox" name="types" value="${esc(t.id)}"> ${esc(t.name)}</label>`).join('') || '<span class="note">Cadastre os lotes primeiro.</span>'}</div></div>
+      <label class="check full"><input type="checkbox" name="include_half" checked> Vale também para meia-entrada</label>
+    </div>
+    <div><button class="btn primary" type="submit">Criar cupom</button></div>
+  </form>
+  <div class="panel"><h2>${num(coupons.length)} cupo${coupons.length === 1 ? 'm' : 'ns'}</h2>
+    ${coupons.length ? `<div class="tablewrap"><table><thead><tr><th>Código</th><th>Desconto</th><th>Vale para</th><th class="num">Usos</th><th class="num">Descontado</th><th>Validade</th><th>Situação</th><th></th></tr></thead><tbody>
+      ${coupons.map(c => { const [st, k] = state(c), u = uses(c.id); return `<tr>
+        <td class="mono"><b>${esc(c.code.toUpperCase())}</b></td>
+        <td>${c.discount_type === 'percent' ? num(c.discount_value) + '%' : money(c.discount_value) + ' / ingresso'}</td>
+        <td>${esc(c.ticket_type_ids ? c.ticket_type_ids.map(typeName).join(', ') : 'Todos os lotes')}<div class="note">${c.include_half ? 'inclui meia' : 'sem meia'}${c.once_per_buyer ? ' · 1 por pessoa' : ''}</div></td>
+        <td class="num">${num(u)}${c.max_uses ? ' / ' + num(c.max_uses) : ''}</td>
+        <td class="num">${money(given(c.id))}</td>
+        <td>${c.valid_until ? esc(fmtShort(c.valid_until)) : '<span class="note">sem prazo</span>'}</td>
+        <td><span class="chip ${k}">${st}</span></td>
+        <td class="num" style="white-space:nowrap"><button class="btn small" data-act="toggle" data-id="${esc(c.id)}" data-on="${c.active ? '1' : ''}">${c.active ? 'Desativar' : 'Ativar'}</button>
+          ${u ? '' : `<button class="btn small danger" data-act="del" data-id="${esc(c.id)}">Excluir</button>`}</td></tr>`; }).join('')}
+    </tbody></table></div><p class="note">Usos contam pedidos pagos e reservas em andamento. Cupom já usado não pode ser excluído; desative para encerrar.</p>`
+    : '<p class="note">Nenhum cupom ainda.</p>'}
+  </div>`, {
+    'input:cpcode': el => { el.value = el.value.toUpperCase().replace(/[^A-Z0-9_-]/g, ''); },
+    toggle: async b => { const { error } = await sb.from('coupons').update({ active: !b.dataset.on }).eq('id', b.dataset.id); if (error) return toast(errMsg(error), 'bad'); toast(b.dataset.on ? 'Cupom desativado.' : 'Cupom ativado.'); reload(); },
+    del: async b => {
+      if (!armed.has(b.dataset.id)) { armed.add(b.dataset.id); b.classList.add('armed'); b.textContent = 'Confirmar'; return; }
+      const { error } = await sb.from('coupons').delete().eq('id', b.dataset.id);
+      if (error) return toast(errMsg(error), 'bad'); toast('Cupom excluído.'); reload();
+    }
+  }, {
+    new: async fd => {
+      const type = fd.get('discount_type'), value = Number(fd.get('discount_value'));
+      if (!(value > 0)) return toast('Informe o valor do desconto.', 'bad');
+      if (type === 'percent' && value > 100) return toast('O percentual vai até 100%.', 'bad');
+      const ids = fd.getAll('types');
+      const body = { event_id: ev.id, code: String(fd.get('code')).trim().toUpperCase(), discount_type: type, discount_value: value,
+        ticket_type_ids: ids.length ? ids : null, include_half: fd.get('include_half') === 'on', once_per_buyer: fd.get('once_per_buyer') === 'on',
+        max_uses: fd.get('max_uses') ? Math.max(1, Math.round(Number(fd.get('max_uses')))) : null,
+        valid_until: fd.get('valid_until') ? fromLocalInput(fd.get('valid_until')) : null };
+      const { error } = await sb.from('coupons').insert(body);
+      if (error) return toast(/coupons_event_code_key/.test(error.message) ? 'Já existe um cupom com este código neste evento.' : errMsg(error), 'bad');
+      toast('Cupom criado.'); reload();
+    }
+  });
+}
+
 async function mFinance(ev, header, reload) {
   const [orders, tickets, expenses] = await Promise.all([
-    sb.from('orders').select('id,subtotal,fee,total,payment_method,payment_fee,commission,split_fee,organizer_amount,status').eq('event_id', ev.id).eq('status', 'confirmed').then(must),
-    sb.from('tickets').select('order_id,ticket_type_id,kind,unit_price,orders!inner(status)').eq('event_id', ev.id).eq('orders.status', 'confirmed').then(must),
+    sb.from('orders').select('id,subtotal,discount,fee,total,payment_method,payment_fee,commission,split_fee,organizer_amount,status').eq('event_id', ev.id).eq('status', 'confirmed').then(must),
+    sb.from('tickets').select('order_id,ticket_type_id,kind,unit_price,discount,orders!inner(status)').eq('event_id', ev.id).eq('orders.status', 'confirmed').then(must),
     sb.from('expenses').select('*').eq('event_id', ev.id).order('due_date', { ascending: true, nullsFirst: false }).then(must)
   ]);
-  const sales = orders.reduce((a, o) => a + Number(o.subtotal), 0);
+  const discounts = orders.reduce((a, o) => a + Number(o.discount || 0), 0);
+  const sales = orders.reduce((a, o) => a + Number(o.subtotal), 0) - discounts;
   const fees = orders.reduce((a, o) => a + Number(o.fee), 0);
   // Pedidos online guardam a cobrança calculada na compra; pedidos antigos/manuais são calculados aqui
   const manualCommission = o => ev.platform_fee_type === 'fixed'
@@ -786,12 +878,12 @@ async function mFinance(ev, header, reload) {
   const result = payout - expTotal;
   const byType = sortTypes(ev.ticket_types).map(t => {
     const ts = tickets.filter(x => x.ticket_type_id === t.id);
-    return { t, full: ts.filter(x => x.kind === 'inteira').length, half: ts.filter(x => x.kind === 'meia').length, rev: ts.reduce((a, x) => a + Number(x.unit_price), 0) };
+    return { t, full: ts.filter(x => x.kind === 'inteira').length, half: ts.filter(x => x.kind === 'meia').length, rev: ts.reduce((a, x) => a + Number(x.unit_price) - Number(x.discount || 0), 0) };
   });
   const org = ev.organizers;
   mount(header + `
   <div class="kpis">
-    <div class="kpi"><div class="v">${money(sales)}</div><div class="l">vendas de ingressos (${num(tickets.length)} emitidos)</div></div>
+    <div class="kpi"><div class="v">${money(sales)}</div><div class="l">vendas de ingressos (${num(tickets.length)} emitidos)${discounts ? `, já descontados ${money(discounts)} de cupons` : ''}</div></div>
     <div class="kpi"><div class="v">${money(commission)}</div><div class="l">cobrança da plataforma (${esc(fmtCharge(ev))})</div></div>
     <div class="kpi strong"><div class="v">${money(payout)}</div><div class="l">repasse ao organizador${splitFees ? ` (já descontados ${money(splitFees)} de taxa de split)` : ''}</div></div>
     <div class="kpi"><div class="v">${money(expTotal)}</div><div class="l">despesas lançadas (${money(expOpen)} a pagar)</div></div>
@@ -837,12 +929,12 @@ async function mFinance(ev, header, reload) {
 }
 
 async function mOrders(ev, header) {
-  const orders = must(await sb.from('orders').select('id,code,status,payment_method,buyer_name,buyer_email,subtotal,fee,total,created_at,tickets(code,type_name,kind,checked_in_at)').eq('event_id', ev.id).order('created_at', { ascending: false }));
+  const orders = must(await sb.from('orders').select('id,code,status,payment_method,coupon_code,discount,buyer_name,buyer_email,subtotal,fee,total,created_at,tickets(code,type_name,kind,checked_in_at)').eq('event_id', ev.id).order('created_at', { ascending: false }));
   const rows = q => orders.filter(o => !q || [o.code, o.buyer_name, o.buyer_email].some(v => String(v).toLowerCase().includes(q))).map(o => `<tr>
     <td class="mono">${esc(o.code)}</td><td>${esc(o.buyer_name)}${o.buyer_email ? `<div class="note">${esc(o.buyer_email)}</div>` : ''}</td>
     <td>${esc(Object.entries((o.tickets || []).reduce((m, t) => { const k = t.type_name + (t.kind === 'meia' ? ' (meia)' : ''); m[k] = (m[k] || 0) + 1; return m; }, {})).map(([k, v]) => v + '× ' + k).join(', '))}</td>
     <td class="num">${num((o.tickets || []).filter(t => t.checked_in_at).length)}/${num((o.tickets || []).length)}</td>
-    <td class="num">${money(o.total)}</td><td>${statusChip(o.status)}<div class="note">${esc({ pix: 'Pix', card: 'Cartão', manual: 'Combinado', free: 'Gratuito' }[o.payment_method] || '')}</div></td><td>${esc(fmtShort(o.created_at))}</td></tr>`).join('');
+    <td class="num">${money(o.total)}${o.coupon_code ? `<div class="note">cupom ${esc(o.coupon_code)} −${money(o.discount)}</div>` : ''}</td><td>${statusChip(o.status)}<div class="note">${esc({ pix: 'Pix', card: 'Cartão', manual: 'Combinado', free: 'Gratuito' }[o.payment_method] || '')}</div></td><td>${esc(fmtShort(o.created_at))}</td></tr>`).join('');
   mount(header + `<div class="panel">
     <div class="row between"><h2>${num(orders.length)} pedido${orders.length === 1 ? '' : 's'}</h2>
       <div class="row"><input class="input" style="width:240px;max-width:100%" placeholder="Buscar nome, e-mail ou pedido" data-input="q" aria-label="Buscar pedidos"><button class="btn small" data-act="csv" ${orders.length ? '' : 'disabled'}>Exportar planilha (CSV)</button></div></div>
@@ -852,8 +944,8 @@ async function mOrders(ev, header) {
     'input:q': el => { document.getElementById('order-rows').innerHTML = rows(el.value.trim().toLowerCase()); },
     csv: () => {
       const q = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
-      const lines = [['pedido', 'situacao', 'pagamento', 'ingresso', 'lote', 'tipo', 'comprador', 'email', 'data_compra', 'utilizado_em'].join(';')];
-      for (const o of orders) for (const t of o.tickets || []) lines.push([o.code, (ORDER_STATUS[o.status] || [o.status])[0], o.payment_method, t.code, t.type_name, t.kind, o.buyer_name, o.buyer_email, fmtShort(o.created_at), t.checked_in_at ? fmtShort(t.checked_in_at) : ''].map(q).join(';'));
+      const lines = [['pedido', 'situacao', 'pagamento', 'cupom', 'ingresso', 'lote', 'tipo', 'comprador', 'email', 'data_compra', 'utilizado_em'].join(';')];
+      for (const o of orders) for (const t of o.tickets || []) lines.push([o.code, (ORDER_STATUS[o.status] || [o.status])[0], o.payment_method, o.coupon_code || '', t.code, t.type_name, t.kind, o.buyer_name, o.buyer_email, fmtShort(o.created_at), t.checked_in_at ? fmtShort(t.checked_in_at) : ''].map(q).join(';'));
       const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
       a.download = `pedidos-${ev.name.toLowerCase().normalize('NFD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}.csv`;

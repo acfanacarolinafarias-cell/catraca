@@ -410,6 +410,31 @@ exception when duplicate_object then null; end $$;
 create unique index if not exists orders_provider_payment_key on public.orders (provider, provider_payment_id) where provider_payment_id is not null;
 create index if not exists orders_pending_idx on public.orders (expires_at) where status = 'pending';
 
+-- Cupons de desconto (criados pelo organizador do evento ou pela administração).
+-- O desconto sai só da parte do organizador: taxa de serviço e cobrança da plataforma
+-- continuam calculadas sobre o preço cheio.
+create table if not exists public.coupons (
+  id               uuid primary key default gen_random_uuid(),
+  event_id         uuid not null references public.events(id) on delete cascade,
+  code             text not null,
+  discount_type    text not null check (discount_type in ('percent', 'fixed')),
+  discount_value   numeric(10,2) not null check (discount_value > 0),
+  ticket_type_ids  uuid[],                       -- null = todos os lotes
+  include_half     boolean not null default true, -- vale também para meia-entrada
+  max_uses         integer check (max_uses is null or max_uses > 0),
+  once_per_buyer   boolean not null default false,
+  valid_until      timestamptz,
+  active           boolean not null default true,
+  created_at       timestamptz not null default now(),
+  constraint coupons_percent_max check (discount_type <> 'percent' or discount_value <= 100)
+);
+create unique index if not exists coupons_event_code_key on public.coupons (event_id, upper(code));
+
+alter table public.orders  add column if not exists coupon_id   uuid references public.coupons(id) on delete set null;
+alter table public.orders  add column if not exists coupon_code text;
+alter table public.orders  add column if not exists discount    numeric(10,2) not null default 0;
+alter table public.tickets add column if not exists discount    numeric(10,2) not null default 0;
+
 -- ---------- Compra (atômica, com trava de lotação) ----------
 
 -- Taxa do meio de pagamento repassada ao comprador: o total é calculado para que,
@@ -453,9 +478,44 @@ begin
   return n;
 end $$;
 
+-- Confere um cupom sem usá-lo (para mostrar o desconto antes da compra)
+create or replace function public.check_coupon(p_event uuid, p_code text) returns jsonb
+language plpgsql stable security definer set search_path = public as $$
+declare
+  c public.coupons%rowtype;
+  v_used integer;
+begin
+  select * into c from public.coupons
+    where event_id = p_event and upper(code) = upper(trim(p_code)) and active;
+  if not found then raise exception 'Cupom não encontrado para este evento.'; end if;
+  if c.valid_until is not null and c.valid_until < now() then raise exception 'Este cupom expirou.'; end if;
+  select count(*) into v_used from public.orders where coupon_id = c.id and status in ('pending', 'confirmed');
+  if c.max_uses is not null and v_used >= c.max_uses then raise exception 'Este cupom já atingiu o limite de usos.'; end if;
+  if c.once_per_buyer and auth.uid() is not null and exists (
+       select 1 from public.orders where coupon_id = c.id and buyer_id = auth.uid() and status in ('pending', 'confirmed')) then
+    raise exception 'Você já usou este cupom.';
+  end if;
+  return jsonb_build_object('code', upper(c.code), 'type', c.discount_type, 'value', c.discount_value,
+    'ticket_type_ids', to_jsonb(c.ticket_type_ids), 'include_half', c.include_half);
+end $$;
+
+-- Desconto de um ingresso pelo cupom
+create or replace function public.coupon_ticket_discount(c public.coupons, p_type uuid, p_kind text, p_unit numeric) returns numeric
+language sql immutable as $$
+  select case
+    when c.id is null then 0
+    when c.ticket_type_ids is not null and not (p_type = any (c.ticket_type_ids)) then 0
+    when p_kind = 'meia' and not c.include_half then 0
+    when c.discount_type = 'percent' then round(p_unit * c.discount_value / 100, 2)
+    else least(c.discount_value, p_unit)
+  end;
+$$;
+
 drop function if exists public.buy_tickets(uuid, jsonb, text, text);
+drop function if exists public.buy_tickets(uuid, jsonb, text, text, text);
 create or replace function public.buy_tickets(
-  p_event uuid, p_items jsonb, p_buyer_name text, p_buyer_email text default '', p_method text default null
+  p_event uuid, p_items jsonb, p_buyer_name text, p_buyer_email text default '',
+  p_method text default null, p_coupon text default null
 ) returns uuid
 language plpgsql security definer set search_path = public as $$
 declare
@@ -463,20 +523,24 @@ declare
   cfg        public.settings%rowtype;
   v_event    public.events%rowtype;
   v_type     public.ticket_types%rowtype;
+  v_coupon   public.coupons%rowtype;
   v_wallet   text := '';
   r          record;
   v_order    uuid;
   v_code     text;
   v_unit     numeric(10,2);
+  v_disc     numeric(10,2);
   v_subtotal numeric(10,2) := 0;
+  v_discount numeric(10,2) := 0;
   v_fee      numeric(10,2);
   v_payfee   numeric(10,2) := 0;
   v_comm     numeric(10,2);
   v_split    numeric(10,2) := 0;
   v_orgamt   numeric(10,2) := 0;
+  v_charge   numeric(10,2);
   v_n        integer := 0;
+  v_used     integer;
   v_online   boolean;
-  v_method   text;
 begin
   if v_uid is null then
     raise exception 'Entre na sua conta para comprar.';
@@ -510,8 +574,22 @@ begin
     end if;
   end if;
 
-  -- Reservas vencidas deste evento voltam para a venda
+  -- Reservas vencidas deste evento voltam para a venda (e liberam usos de cupom)
   perform public.release_expired(p_event);
+
+  -- Cupom: travado para o limite de usos valer mesmo com compras simultâneas
+  if coalesce(trim(p_coupon), '') <> '' then
+    select * into v_coupon from public.coupons
+      where event_id = p_event and upper(code) = upper(trim(p_coupon)) and active for update;
+    if not found then raise exception 'Cupom não encontrado para este evento.'; end if;
+    if v_coupon.valid_until is not null and v_coupon.valid_until < now() then raise exception 'Este cupom expirou.'; end if;
+    select count(*) into v_used from public.orders where coupon_id = v_coupon.id and status in ('pending', 'confirmed');
+    if v_coupon.max_uses is not null and v_used >= v_coupon.max_uses then raise exception 'Este cupom já atingiu o limite de usos.'; end if;
+    if v_coupon.once_per_buyer and exists (
+         select 1 from public.orders where coupon_id = v_coupon.id and buyer_id = v_uid and status in ('pending', 'confirmed')) then
+      raise exception 'Você já usou este cupom.';
+    end if;
+  end if;
 
   -- Trava e confere cada lote (inteira + meia somadas)
   for r in
@@ -538,8 +616,9 @@ begin
     exit when not exists (select 1 from public.orders where code = v_code);
   end loop;
 
-  insert into public.orders (code, event_id, buyer_id, buyer_name, buyer_email)
-  values (v_code, p_event, v_uid, trim(p_buyer_name), coalesce(trim(p_buyer_email), ''))
+  insert into public.orders (code, event_id, buyer_id, buyer_name, buyer_email, coupon_id, coupon_code)
+  values (v_code, p_event, v_uid, trim(p_buyer_name), coalesce(trim(p_buyer_email), ''),
+          v_coupon.id, case when v_coupon.id is not null then upper(v_coupon.code) end)
   returning id into v_order;
 
   for r in
@@ -557,35 +636,45 @@ begin
       raise exception 'O lote "%" não aceita meia-entrada.', v_type.name;
     end if;
     v_unit := case when r.kind = 'meia' then round(v_type.price / 2, 2) else v_type.price end;
+    v_disc := public.coupon_ticket_discount(v_coupon, v_type.id, r.kind, v_unit);
     for i in 1 .. r.qty loop
       v_n := v_n + 1;
-      insert into public.tickets (code, order_id, event_id, ticket_type_id, type_name, kind, unit_price)
-      values (v_code || '-' || v_n, v_order, p_event, v_type.id, v_type.name, r.kind, v_unit);
+      insert into public.tickets (code, order_id, event_id, ticket_type_id, type_name, kind, unit_price, discount)
+      values (v_code || '-' || v_n, v_order, p_event, v_type.id, v_type.name, r.kind, v_unit, v_disc);
     end loop;
     v_subtotal := v_subtotal + v_unit * r.qty;
+    v_discount := v_discount + v_disc * r.qty;
   end loop;
 
+  if v_coupon.id is not null and v_discount = 0 then
+    raise exception 'O cupom % não vale para os ingressos escolhidos.', upper(v_coupon.code);
+  end if;
+
+  -- Taxa de serviço e cobrança da plataforma: sobre o preço cheio
   v_fee  := round(v_subtotal * v_event.fee_pct / 100, 2);
   v_comm := case when v_event.platform_fee_type = 'fixed'
                  then round(v_n * v_event.platform_fee_fixed, 2)
                  else round(v_subtotal * v_event.platform_pct / 100, 2) end;
   if v_event.organizer_id is not null then
     v_split  := case when v_online then cfg.split_fee_fixed else 0 end;
-    v_orgamt := greatest(v_subtotal - v_comm - v_split, 0);
+    if v_discount > 0 and v_subtotal - v_discount < v_comm + v_split then
+      raise exception 'O desconto do cupom é maior do que o permitido para estes ingressos.';
+    end if;
+    v_orgamt := greatest(v_subtotal - v_discount - v_comm - v_split, 0);
   end if;
+  v_charge := v_subtotal - v_discount + v_fee;   -- valor antes da taxa do meio de pagamento
 
-  if v_online and v_subtotal + v_fee > 0 then
-    v_method := p_method;
-    v_payfee := public.payment_fee_for(v_subtotal + v_fee, p_method);
+  if v_online and v_charge > 0 then
+    v_payfee := public.payment_fee_for(v_charge, p_method);
     update public.orders set
-      subtotal = v_subtotal, fee = v_fee, payment_fee = v_payfee, total = v_subtotal + v_fee + v_payfee,
+      subtotal = v_subtotal, discount = v_discount, fee = v_fee, payment_fee = v_payfee, total = v_charge + v_payfee,
       commission = v_comm, split_fee = v_split, organizer_amount = v_orgamt,
-      payment_method = v_method, status = 'pending',
+      payment_method = p_method, status = 'pending',
       expires_at = now() + make_interval(mins => coalesce(cfg.reservation_minutes, 15))
     where id = v_order;
   else
     update public.orders set
-      subtotal = v_subtotal, fee = v_fee, total = v_subtotal + v_fee,
+      subtotal = v_subtotal, discount = v_discount, fee = v_fee, total = v_charge,
       commission = v_comm, split_fee = 0, organizer_amount = v_orgamt,
       payment_method = case when v_online then 'free' else 'manual' end,
       status = 'confirmed', paid_at = now()
@@ -730,6 +819,7 @@ alter table public.expenses     enable row level security;
 alter table public.staff        enable row level security;
 alter table public.staff_events enable row level security;
 alter table public.settings     enable row level security;
+alter table public.coupons      enable row level security;
 
 drop policy if exists profiles_select on public.profiles;
 create policy profiles_select on public.profiles for select
@@ -817,13 +907,17 @@ drop policy if exists settings_update on public.settings;
 create policy settings_update on public.settings for update
   using (public.is_admin()) with check (public.is_admin());
 
+drop policy if exists coupons_manage on public.coupons;
+create policy coupons_manage on public.coupons for all
+  using (public.can_manage_event(event_id)) with check (public.can_manage_event(event_id));
+
 -- ---------- Privilégios por coluna ----------
 -- Pedidos e ingressos só são criados pelas funções acima; "sold" e "role"
 -- não podem ser alterados direto pelo navegador.
 
 revoke all on public.profiles, public.organizers, public.events, public.ticket_types,
               public.orders, public.tickets, public.expenses,
-              public.staff, public.staff_events, public.settings from anon, authenticated;
+              public.staff, public.staff_events, public.settings, public.coupons from anon, authenticated;
 
 grant select on public.events, public.ticket_types to anon, authenticated;
 grant select, update (full_name) on public.profiles to authenticated;
@@ -841,9 +935,12 @@ grant select on public.orders, public.tickets to authenticated;
 grant select, insert, update, delete on public.expenses to authenticated;
 grant select, insert (id, organizer_id, name, email), update (name, email), delete on public.staff to authenticated;
 grant select, insert, delete on public.staff_events to authenticated;
+grant select, insert, update, delete on public.coupons to authenticated;
 
-revoke execute on function public.buy_tickets(uuid, jsonb, text, text, text) from public, anon;
-grant execute on function public.buy_tickets(uuid, jsonb, text, text, text) to authenticated;
+revoke execute on function public.buy_tickets(uuid, jsonb, text, text, text, text) from public, anon;
+grant execute on function public.buy_tickets(uuid, jsonb, text, text, text, text) to authenticated;
+revoke execute on function public.check_coupon(uuid, text) from public, anon;
+grant execute on function public.check_coupon(uuid, text) to authenticated;
 revoke execute on function public.release_expired(uuid) from public, anon;
 grant execute on function public.release_expired(uuid) to authenticated;
 revoke execute on function public.mark_refunded(uuid) from public, anon;
