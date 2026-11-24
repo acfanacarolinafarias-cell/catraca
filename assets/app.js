@@ -190,6 +190,7 @@ async function route() {
       case undefined: return await vHome();
       case 'evento': return await vEvent(b);
       case 'pedido': return requireLogin() && await vOrder(b);
+      case 'pagamento': return requireLogin() && await vPay(b);
       case 'entrar': return me.user ? go(homeFor()) : vLogin(b || 'entrar');
       case 'nova-senha': return vNewPassword();
       case 'meus-ingressos': return requireLogin() && await vMyTickets();
@@ -279,12 +280,25 @@ async function vHome() {
 }
 
 /* ================= evento + compra ================= */
+// Taxa do meio de pagamento repassada ao comprador (mesma conta do banco: payment_fee_for)
+function payFee(base, method, cfg) {
+  if (!(base > 0) || !cfg?.payments_enabled) return 0;
+  const f = Number(method === 'pix' ? cfg.pix_fee_fixed : cfg.card_fee_fixed) || 0;
+  const p = Number(method === 'pix' ? cfg.pix_fee_pct : cfg.card_fee_pct) || 0;
+  return Math.ceil(((base + f) / (1 - p / 100) - base) * 100 - 1e-6) / 100;
+}
+
 async function vEvent(id) {
   loading();
-  const ev = must(await sb.from('events').select(EV_PUBLIC).eq('id', id).maybeSingle());
+  const [ev, cfg] = await Promise.all([
+    sb.from('events').select(EV_PUBLIC).eq('id', id).maybeSingle().then(must),
+    getSettings()
+  ]);
   if (!ev) return vMessage('Evento não encontrado', 'Ele pode ter sido removido ou ainda não foi publicado.');
+  const online = !!cfg.payments_enabled;
   const types = sortTypes(ev.ticket_types);
   const cart = {};
+  let method = 'pix';
   const past = isPast(ev);
   const inCart = tid => (cart[tid + '|inteira'] || 0) + (cart[tid + '|meia'] || 0);
   const lines = () => {
@@ -295,7 +309,8 @@ async function vEvent(id) {
     }
     const subtotal = out.reduce((a, l) => a + l.unit * l.qty, 0);
     const fee = Math.round(subtotal * Number(ev.fee_pct)) / 100;
-    return { out, subtotal, fee, total: subtotal + fee, count: out.reduce((a, l) => a + l.qty, 0) };
+    const pfee = payFee(subtotal + fee, method, cfg);
+    return { out, subtotal, fee, pfee, total: subtotal + fee + pfee, count: out.reduce((a, l) => a + l.qty, 0) };
   };
 
   const drawLots = () => {
@@ -315,10 +330,17 @@ async function vEvent(id) {
     document.getElementById('summary').innerHTML = c.count
       ? `<div class="sum">${c.out.map(l => `<div><span>${l.qty}× ${esc(l.t.name)}${l.kind === 'meia' ? ' (meia)' : ''}</span><span>${money(l.unit * l.qty)}</span></div>`).join('')}
         <div class="note"><span>Taxa de serviço (${num(ev.fee_pct)}%)</span><span>${money(c.fee)}</span></div>
+        ${online && c.pfee ? `<div class="note"><span>Taxa do ${method === 'pix' ? 'Pix' : 'cartão'}</span><span>${money(c.pfee)}</span></div>` : ''}
         <div class="total"><span>Total</span><span>${money(c.total)}</span></div></div>`
       : '<p class="note">Adicione ingressos para ver o total.</p>';
+    if (online) {
+      const base = c.subtotal + c.fee;
+      document.querySelectorAll('[data-method-total]').forEach(el => {
+        el.textContent = c.count ? money(base + payFee(base, el.dataset.methodTotal, cfg)) : '';
+      });
+    }
     const btn = document.getElementById('buy-btn');
-    if (btn) { btn.disabled = !c.count; btn.textContent = c.count ? `Confirmar ${c.count} ingresso${c.count > 1 ? 's' : ''}` : 'Confirmar pedido'; }
+    if (btn) { btn.disabled = !c.count; btn.textContent = !c.count ? (online ? 'Ir para o pagamento' : 'Confirmar pedido') : online ? `Pagar ${money(c.total)}` : `Confirmar ${c.count} ingresso${c.count > 1 ? 's' : ''}`; }
   };
 
   const hasHalf = types.some(t => t.allows_half);
@@ -341,22 +363,36 @@ async function vEvent(id) {
         : me.user ? `<form data-form="buy" class="panel" style="padding:0;border:0">
           <div class="field"><label for="buyer-name">Nome no ingresso</label><input id="buyer-name" name="name" required autocomplete="name" value="${esc(me.profile?.full_name || '')}"></div>
           <div class="field"><label for="buyer-email">E-mail para contato</label><input id="buyer-email" name="email" type="email" autocomplete="email" value="${esc(me.user.email)}"></div>
-          <button class="btn primary" id="buy-btn" type="submit" disabled>Confirmar pedido</button>
-          <p class="note">A reserva fica registrada e os códigos de entrada são emitidos na hora. O pagamento é combinado com quem organiza o evento.</p>
+          ${online ? `
+          <div class="field"><span class="label">Forma de pagamento</span>
+            <div class="paychoice">
+              <label><input type="radio" name="method" value="pix" data-change="method" checked><span><b>Pix</b><small data-method-total="pix"></small></span></label>
+              <label><input type="radio" name="method" value="card" data-change="method"><span><b>Cartão de crédito</b><small data-method-total="card"></small></span></label>
+            </div></div>
+          <div class="field"><label for="buyer-doc">CPF de quem paga</label><input id="buyer-doc" name="document" inputmode="numeric" autocomplete="off" required placeholder="000.000.000-00" data-input="doc"></div>
+          <button class="btn primary" id="buy-btn" type="submit" disabled>Ir para o pagamento</button>
+          <p class="note">As vagas ficam reservadas por ${num(cfg.reservation_minutes || 15)} minutos enquanto você paga. Os ingressos com QR Code aparecem assim que o pagamento for aprovado.</p>`
+          : `<button class="btn primary" id="buy-btn" type="submit" disabled>Confirmar pedido</button>
+          <p class="note">A reserva fica registrada e os códigos de entrada são emitidos na hora. O pagamento é combinado com quem organiza o evento.</p>`}
         </form>`
         : `<div class="msg info">Entre na sua conta ou crie uma para comprar.</div><button class="btn primary" data-act="login">Entrar para comprar</button>`}
     </div>
   </div>`, {
     inc: b => { cart[b.dataset.k] = (cart[b.dataset.k] || 0) + 1; drawLots(); drawSummary(); },
     dec: b => { cart[b.dataset.k] = Math.max(0, (cart[b.dataset.k] || 0) - 1); drawLots(); drawSummary(); },
-    login: () => requireLogin()
+    login: () => requireLogin(),
+    'change:method': el => { method = el.value; drawSummary(); },
+    'input:doc': el => { const d = digits(el.value).slice(0, 14); el.value = d.length === 11 ? fmtDoc('PF', d) : d.length === 14 ? fmtDoc('PJ', d) : d; }
   }, {
     buy: async fd => {
       const c = lines(); if (!c.count) return;
+      const doc = digits(fd.get('document'));
+      if (online && !(doc.length === 11 ? validCPF(doc) : doc.length === 14 ? validCNPJ(doc) : false)) return toast('CPF inválido. Confira os números.', 'bad');
       const items = c.out.map(l => ({ type_id: l.t.id, kind: l.kind, qty: l.qty }));
-      const { data, error } = await sb.rpc('buy_tickets', { p_event: ev.id, p_items: items, p_buyer_name: String(fd.get('name') || '').trim(), p_buyer_email: String(fd.get('email') || '').trim() });
+      const { data, error } = await sb.rpc('buy_tickets', { p_event: ev.id, p_items: items, p_buyer_name: String(fd.get('name') || '').trim(), p_buyer_email: String(fd.get('email') || '').trim(), p_method: online ? method : null });
       if (error) { toast(errMsg(error), 'bad'); return vEvent(id); }
-      go('#/pedido/' + data);
+      if (online) { try { sessionStorage.setItem('doc:' + data, doc); } catch (_) {} }
+      go((online ? '#/pagamento/' : '#/pedido/') + data);
     }
   });
   drawLots(); drawSummary();
@@ -371,12 +407,18 @@ function passList(tickets) {
     </div>`).join('')}</div>`;
 }
 
-const ORDER_FIELDS = 'id,code,subtotal,fee,total,created_at,buyer_name,events(id,name,starts_at,venue,city),tickets(code,type_name,kind,checked_in_at)';
+const ORDER_FIELDS = 'id,code,status,expires_at,payment_method,subtotal,fee,payment_fee,total,created_at,buyer_name,events(id,name,starts_at,venue,city),tickets(code,type_name,kind,checked_in_at)';
+const ORDER_STATUS = {
+  pending: ['Aguardando pagamento', ''], confirmed: ['Pago', 'ok'], expired: ['Reserva expirada', 'bad'], canceled: ['Cancelado', 'bad'],
+  refunded: ['Estornado', 'bad'], refund_needed: ['Pago fora do prazo · devolução pendente', 'bad']
+};
+const statusChip = s => { const [t, k] = ORDER_STATUS[s] || [s, '']; return `<span class="chip ${k}">${esc(t)}</span>`; };
 
 async function vOrder(id) {
   loading();
   const o = must(await sb.from('orders').select(ORDER_FIELDS).eq('id', id).maybeSingle());
   if (!o) return vMessage('Pedido não encontrado', 'Confira em “Meus ingressos”.');
+  if (o.status !== 'confirmed') return go('#/pagamento/' + id);
   mount(`<div class="panel medium" style="width:100%">
     <div class="msg ok">Pedido ${esc(o.code)} confirmado. Mostre os códigos abaixo na entrada.</div>
     <div class="row between"><h2>${esc(o.events?.name)}</h2><span class="note">${esc(fmtLong(o.events?.starts_at))}</span></div>
@@ -387,15 +429,104 @@ async function vOrder(id) {
   drawQRs();
 }
 
+async function invokeFn(name, body) {
+  const { data, error } = await sb.functions.invoke(name, { body });
+  if (!error) return data;
+  let msg = '';
+  try { msg = (await error.context?.json())?.error || ''; } catch (_) {}
+  throw new Error(msg || 'Não foi possível falar com o serviço de pagamento. Tente de novo em instantes.');
+}
+
+async function vPay(id) {
+  loading();
+  const FIELDS = 'id,code,status,expires_at,payment_method,subtotal,fee,payment_fee,total,provider_data,events(id,name,starts_at)';
+  let o = must(await sb.from('orders').select(FIELDS).eq('id', id).maybeSingle());
+  if (!o) return vMessage('Pedido não encontrado', 'Confira em “Meus ingressos”.');
+  if (o.status === 'confirmed') return go('#/pedido/' + id);
+  let timer = null, poll = null;
+  teardown = () => { clearInterval(timer); clearInterval(poll); };
+  const head = `<div><a class="linkbtn" href="#/evento/${esc(o.events?.id)}">← ${esc(o.events?.name)}</a></div>`;
+  if (o.status !== 'pending') {
+    return mount(head + `<div class="panel medium" style="width:100%">${statusChip(o.status)}
+      <h2>${o.status === 'expired' ? 'O prazo para pagar acabou' : o.status === 'refund_needed' ? 'Pagamento recebido depois do prazo' : 'Pedido sem pagamento'}</h2>
+      <p class="note">${o.status === 'expired' ? 'As vagas voltaram para a venda. Faça um novo pedido se ainda houver ingressos.' : o.status === 'refund_needed' ? 'Os ingressos esgotaram antes de o pagamento chegar. A organização vai devolver o valor.' : 'Este pedido foi cancelado ou estornado.'}</p>
+      <a class="btn primary" href="#/evento/${esc(o.events?.id)}">Voltar ao evento</a></div>`);
+  }
+  const card = o.payment_method === 'card';
+  const summary = `<div class="sum"><div><span>Ingressos</span><span>${money(o.subtotal)}</span></div><div class="note"><span>Taxa de serviço</span><span>${money(o.fee)}</span></div>
+    ${Number(o.payment_fee) ? `<div class="note"><span>Taxa do ${card ? 'cartão' : 'Pix'}</span><span>${money(o.payment_fee)}</span></div>` : ''}
+    <div class="total"><span>Total</span><span>${money(o.total)}</span></div></div>`;
+  const tick = () => {
+    const el = document.getElementById('countdown'); if (!el) return;
+    const ms = new Date(o.expires_at).getTime() - Date.now();
+    if (ms <= 0) { el.textContent = 'Prazo encerrado'; clearInterval(timer); return; }
+    el.textContent = `${Math.floor(ms / 60000)}:${pad(Math.floor(ms / 1000) % 60)}`;
+  };
+  const drawPayment = p => {
+    const box = document.getElementById('paybox');
+    if (!p) return;
+    if (p.pix) {
+      box.innerHTML = `<div class="pixbox"><img alt="QR Code Pix para pagamento" src="data:image/png;base64,${esc(p.pix.qrImage)}"></div>
+        <p class="note">Abra o app do seu banco, escolha <b>Pix → Ler QR Code</b> ou use o código "copia e cola":</p>
+        <div class="row"><input class="input mono" id="pix-code" readonly value="${esc(p.pix.payload)}" aria-label="Código Pix copia e cola" style="flex:1;min-width:0"><button class="btn" type="button" data-act="copy">Copiar código</button></div>`;
+    } else if (p.checkout_url && /^https:\/\//.test(p.checkout_url)) {
+      box.innerHTML = `<p>O pagamento com cartão acontece na página segura do meio de pagamento.</p>
+        <a class="btn primary" href="${esc(p.checkout_url)}" target="_blank" rel="noopener">Pagar com cartão</a>
+        <p class="note">Depois de pagar, volte para esta aba. Os ingressos aparecem aqui sozinhos.</p>`;
+    }
+  };
+  const start = async doc => {
+    document.getElementById('paybox').innerHTML = '<p class="note">Gerando a cobrança…</p>';
+    try {
+      const r = await invokeFn('checkout', { order_id: id, document: doc });
+      if (r.status && r.status !== 'pending') return vPay(id);
+      drawPayment(r.payment);
+    } catch (e) { document.getElementById('paybox').innerHTML = `<div class="msg bad">${esc(e.message)}</div>${docForm}`; }
+  };
+  const docForm = `<form data-form="doc" class="row"><input class="input" name="document" inputmode="numeric" placeholder="CPF de quem paga" aria-label="CPF de quem paga" required style="flex:1;min-width:0"><button class="btn primary" type="submit">Gerar pagamento</button></form>`;
+  mount(head + `<div class="detail">
+    <div class="panel"><div class="row between"><h2>${card ? 'Pagamento com cartão' : 'Pague com Pix'}</h2><span class="chip">Pedido ${esc(o.code)}</span></div>
+      <div class="msg info">Reserva válida por <b id="countdown">--:--</b>. Depois disso as vagas voltam para a venda.</div>
+      <div id="paybox"></div>
+      <p class="note" id="wait">Aguardando a confirmação do pagamento… esta página atualiza sozinha.</p>
+    </div>
+    <div class="panel"><h2>${esc(o.events?.name)}</h2><p class="note">${esc(fmtLong(o.events?.starts_at))}</p>${summary}</div>
+  </div>`, {
+    copy: async () => {
+      const el = document.getElementById('pix-code');
+      try { await navigator.clipboard.writeText(el.value); toast('Código Pix copiado.'); } catch (_) { el.select(); toast('Selecione e copie o código.'); }
+    }
+  }, {
+    doc: async fd => {
+      const d = digits(fd.get('document'));
+      if (!(d.length === 11 ? validCPF(d) : d.length === 14 ? validCNPJ(d) : false)) return toast('CPF inválido. Confira os números.', 'bad');
+      await start(d);
+    }
+  });
+  tick(); timer = setInterval(tick, 1000);
+  if (o.provider_data) drawPayment(o.provider_data);
+  else {
+    let doc = ''; try { doc = sessionStorage.getItem('doc:' + id) || ''; } catch (_) {}
+    if (doc) start(doc); else document.getElementById('paybox').innerHTML = docForm;
+  }
+  poll = setInterval(async () => {
+    const { data } = await sb.from('orders').select('status').eq('id', id).maybeSingle();
+    if (data && data.status !== 'pending') { clearInterval(poll); clearInterval(timer); if (data.status === 'confirmed') toast('Pagamento aprovado!'); vPay(id); }
+    else if (new Date(o.expires_at).getTime() < Date.now() - 5000) { await sb.rpc('release_expired', { p_event: null }); }
+  }, 4000);
+}
+
 async function vMyTickets() {
   loading();
-  const orders = must(await sb.from('orders').select(ORDER_FIELDS).eq('buyer_id', me.user.id).order('created_at', { ascending: false }));
+  const orders = must(await sb.from('orders').select(ORDER_FIELDS).eq('buyer_id', me.user.id).neq('status', 'canceled').order('created_at', { ascending: false }));
   const head = `<div class="page-head"><div><div class="eyebrow">Carteira</div><h1>Meus ingressos</h1><p>Cada código vale uma entrada. Depois de validado na porta, o ingresso aparece como utilizado.</p></div></div>`;
   if (!orders.length) return mount(head + `<div class="empty"><h2>Você ainda não tem ingressos</h2><p>Escolha um evento na programação.</p><a class="btn primary" href="#/">Ver eventos</a></div>`);
   mount(head + orders.map(o => `<div class="panel">
-    <div class="row between"><h2>${esc(o.events?.name)}</h2><span class="note mono">Pedido ${esc(o.code)}</span></div>
+    <div class="row between"><h2>${esc(o.events?.name)}</h2><span class="row">${o.status !== 'confirmed' ? statusChip(o.status) : ''}<span class="note mono">Pedido ${esc(o.code)}</span></span></div>
     <p class="note">${esc(fmtLong(o.events?.starts_at))} · ${esc(o.events?.venue || '')} · ${money(o.total)}</p>
-    ${passList(o.tickets)}</div>`).join(''));
+    ${o.status === 'confirmed' ? passList(o.tickets)
+      : o.status === 'pending' && new Date(o.expires_at) > new Date() ? `<a class="btn primary" href="#/pagamento/${esc(o.id)}">Concluir pagamento</a>`
+      : `<p class="note">${o.status === 'refund_needed' ? 'O pagamento chegou depois de os ingressos esgotarem. A organização vai devolver o valor.' : 'Este pedido não gerou ingressos.'}</p>`}</div>`).join(''));
   drawQRs();
 }
 
@@ -529,9 +660,11 @@ function orgEditableFields(o = {}) {
       <div class="field"><label for="o-ag-${esc(o.id || 'n')}">Agência</label><input id="o-ag-${esc(o.id || 'n')}" name="bank_agency" inputmode="numeric" value="${esc(o.bank_agency || '')}"></div>
       <div class="field"><label for="o-acc-${esc(o.id || 'n')}">Conta</label><input id="o-acc-${esc(o.id || 'n')}" name="bank_account" value="${esc(o.bank_account || '')}"></div>
     </div>
+    <div class="field full"><label for="o-wallet-${esc(o.id || 'n')}">Recebimento online: Wallet ID da conta Asaas</label><input id="o-wallet-${esc(o.id || 'n')}" name="payout_account" class="mono" autocomplete="off" placeholder="ex.: 0b3a1c2d-…" value="${esc(o.payout_account || '')}">
+      <span class="note">É para onde vai a sua parte das vendas online, automaticamente. Fica no Asaas, em Integrações → Wallet ID. Sem ele, os eventos não vendem online.</span></div>
   </div>`;
 }
-const orgEditablePayload = fd => Object.fromEntries(['trade_name', 'phone', 'pix_key', 'bank_name', 'bank_agency', 'bank_account'].map(k => [k, String(fd.get(k) || '').trim()]));
+const orgEditablePayload = fd => ({ ...Object.fromEntries(['trade_name', 'phone', 'pix_key', 'bank_name', 'bank_agency', 'bank_account', 'payout_account'].map(k => [k, String(fd.get(k) || '').trim()])), payout_provider: 'asaas' });
 
 /* ================= gestão de um evento (organizador e admin) ================= */
 const MANAGE_TABS = [['info', 'Informações'], ['lotes', 'Lotes'], ['financeiro', 'Financeiro'], ['pedidos', 'Pedidos'], ['entrada', 'Entrada']];
@@ -632,16 +765,22 @@ function mLotes(ev, header, reload) {
 
 async function mFinance(ev, header, reload) {
   const [orders, tickets, expenses] = await Promise.all([
-    sb.from('orders').select('subtotal,fee,total').eq('event_id', ev.id).then(must),
-    sb.from('tickets').select('ticket_type_id,kind,unit_price').eq('event_id', ev.id).then(must),
+    sb.from('orders').select('id,subtotal,fee,total,payment_method,payment_fee,commission,split_fee,organizer_amount,status').eq('event_id', ev.id).eq('status', 'confirmed').then(must),
+    sb.from('tickets').select('order_id,ticket_type_id,kind,unit_price,orders!inner(status)').eq('event_id', ev.id).eq('orders.status', 'confirmed').then(must),
     sb.from('expenses').select('*').eq('event_id', ev.id).order('due_date', { ascending: true, nullsFirst: false }).then(must)
   ]);
   const sales = orders.reduce((a, o) => a + Number(o.subtotal), 0);
   const fees = orders.reduce((a, o) => a + Number(o.fee), 0);
-  const commission = ev.platform_fee_type === 'fixed'
-    ? Math.round(tickets.length * Number(ev.platform_fee_fixed) * 100) / 100
-    : Math.round(sales * Number(ev.platform_pct)) / 100;
-  const payout = sales - commission;
+  // Pedidos online guardam a cobrança calculada na compra; pedidos antigos/manuais são calculados aqui
+  const manualCommission = o => ev.platform_fee_type === 'fixed'
+    ? tickets.filter(t => t.order_id === o.id).length * Number(ev.platform_fee_fixed)
+    : Number(o.subtotal) * Number(ev.platform_pct) / 100;
+  const online = orders.filter(o => o.payment_method === 'pix' || o.payment_method === 'card');
+  const commission = Math.round(orders.reduce((a, o) => a + (o.payment_method === 'manual' ? manualCommission(o) : Number(o.commission)), 0) * 100) / 100;
+  const splitFees = orders.reduce((a, o) => a + Number(o.split_fee), 0);
+  const payFees = orders.reduce((a, o) => a + Number(o.payment_fee), 0);
+  const autoPaid = online.reduce((a, o) => a + Number(o.organizer_amount), 0);
+  const payout = sales - commission - splitFees;
   const expTotal = expenses.reduce((a, x) => a + Number(x.amount), 0);
   const expOpen = expenses.filter(x => !x.paid).reduce((a, x) => a + Number(x.amount), 0);
   const result = payout - expTotal;
@@ -654,11 +793,12 @@ async function mFinance(ev, header, reload) {
   <div class="kpis">
     <div class="kpi"><div class="v">${money(sales)}</div><div class="l">vendas de ingressos (${num(tickets.length)} emitidos)</div></div>
     <div class="kpi"><div class="v">${money(commission)}</div><div class="l">cobrança da plataforma (${esc(fmtCharge(ev))})</div></div>
-    <div class="kpi strong"><div class="v">${money(payout)}</div><div class="l">repasse previsto ao organizador</div></div>
+    <div class="kpi strong"><div class="v">${money(payout)}</div><div class="l">repasse ao organizador${splitFees ? ` (já descontados ${money(splitFees)} de taxa de split)` : ''}</div></div>
     <div class="kpi"><div class="v">${money(expTotal)}</div><div class="l">despesas lançadas (${money(expOpen)} a pagar)</div></div>
     <div class="kpi strong"><div class="v" style="color:${result < 0 ? 'var(--bad)' : 'var(--ok)'}">${money(result)}</div><div class="l">resultado (repasse − despesas)</div></div>
   </div>
-  <p class="note">Taxas de serviço pagas pelos compradores: ${money(fees)}. Elas ficam com a plataforma e não entram no repasse.</p>
+  <p class="note">Taxas de serviço pagas pelos compradores: ${money(fees)}. Elas ficam com a plataforma e não entram no repasse.${payFees ? ` Taxas de Pix e cartão pagas pelos compradores: ${money(payFees)} (cobrem a tarifa do meio de pagamento).` : ''}</p>
+  ${online.length ? `<div class="msg ok">${money(autoPaid)} de ${num(online.length)} pagamento${online.length > 1 ? 's' : ''} online já foram enviados automaticamente para a conta do organizador no meio de pagamento (split). Só pedidos pagos entram nestes números.</div>` : ''}
   <div class="two">
     <div class="panel"><h2>Vendas por lote</h2>
       <div class="tablewrap"><table><thead><tr><th>Lote</th><th class="num">Inteira</th><th class="num">Meia</th><th class="num">Ocupação</th><th class="num">Receita</th></tr></thead><tbody>
@@ -697,23 +837,23 @@ async function mFinance(ev, header, reload) {
 }
 
 async function mOrders(ev, header) {
-  const orders = must(await sb.from('orders').select('id,code,buyer_name,buyer_email,subtotal,fee,total,created_at,tickets(code,type_name,kind,checked_in_at)').eq('event_id', ev.id).order('created_at', { ascending: false }));
+  const orders = must(await sb.from('orders').select('id,code,status,payment_method,buyer_name,buyer_email,subtotal,fee,total,created_at,tickets(code,type_name,kind,checked_in_at)').eq('event_id', ev.id).order('created_at', { ascending: false }));
   const rows = q => orders.filter(o => !q || [o.code, o.buyer_name, o.buyer_email].some(v => String(v).toLowerCase().includes(q))).map(o => `<tr>
     <td class="mono">${esc(o.code)}</td><td>${esc(o.buyer_name)}${o.buyer_email ? `<div class="note">${esc(o.buyer_email)}</div>` : ''}</td>
     <td>${esc(Object.entries((o.tickets || []).reduce((m, t) => { const k = t.type_name + (t.kind === 'meia' ? ' (meia)' : ''); m[k] = (m[k] || 0) + 1; return m; }, {})).map(([k, v]) => v + '× ' + k).join(', '))}</td>
     <td class="num">${num((o.tickets || []).filter(t => t.checked_in_at).length)}/${num((o.tickets || []).length)}</td>
-    <td class="num">${money(o.total)}</td><td>${esc(fmtShort(o.created_at))}</td></tr>`).join('');
+    <td class="num">${money(o.total)}</td><td>${statusChip(o.status)}<div class="note">${esc({ pix: 'Pix', card: 'Cartão', manual: 'Combinado', free: 'Gratuito' }[o.payment_method] || '')}</div></td><td>${esc(fmtShort(o.created_at))}</td></tr>`).join('');
   mount(header + `<div class="panel">
     <div class="row between"><h2>${num(orders.length)} pedido${orders.length === 1 ? '' : 's'}</h2>
       <div class="row"><input class="input" style="width:240px;max-width:100%" placeholder="Buscar nome, e-mail ou pedido" data-input="q" aria-label="Buscar pedidos"><button class="btn small" data-act="csv" ${orders.length ? '' : 'disabled'}>Exportar planilha (CSV)</button></div></div>
-    ${orders.length ? `<div class="tablewrap"><table><thead><tr><th>Pedido</th><th>Comprador</th><th>Ingressos</th><th class="num">Entradas</th><th class="num">Total</th><th>Data</th></tr></thead><tbody id="order-rows">${rows('')}</tbody></table></div>`
+    ${orders.length ? `<div class="tablewrap"><table><thead><tr><th>Pedido</th><th>Comprador</th><th>Ingressos</th><th class="num">Entradas</th><th class="num">Total</th><th>Situação</th><th>Data</th></tr></thead><tbody id="order-rows">${rows('')}</tbody></table></div>`
       : '<p class="note">Os pedidos aparecem aqui conforme o público compra.</p>'}
   </div>`, {
     'input:q': el => { document.getElementById('order-rows').innerHTML = rows(el.value.trim().toLowerCase()); },
     csv: () => {
       const q = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
-      const lines = [['pedido', 'ingresso', 'lote', 'tipo', 'comprador', 'email', 'data_compra', 'utilizado_em'].join(';')];
-      for (const o of orders) for (const t of o.tickets || []) lines.push([o.code, t.code, t.type_name, t.kind, o.buyer_name, o.buyer_email, fmtShort(o.created_at), t.checked_in_at ? fmtShort(t.checked_in_at) : ''].map(q).join(';'));
+      const lines = [['pedido', 'situacao', 'pagamento', 'ingresso', 'lote', 'tipo', 'comprador', 'email', 'data_compra', 'utilizado_em'].join(';')];
+      for (const o of orders) for (const t of o.tickets || []) lines.push([o.code, (ORDER_STATUS[o.status] || [o.status])[0], o.payment_method, t.code, t.type_name, t.kind, o.buyer_name, o.buyer_email, fmtShort(o.created_at), t.checked_in_at ? fmtShort(t.checked_in_at) : ''].map(q).join(';'));
       const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
       a.download = `pedidos-${ev.name.toLowerCase().normalize('NFD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}.csv`;
@@ -930,12 +1070,25 @@ async function vAdmin(tab) {
         <div class="field full"><label for="c-fee">Taxa de serviço paga pelo comprador (%)</label><input id="c-fee" name="default_fee_pct" type="number" min="0" max="30" step="0.5" value="${esc(cfg.default_fee_pct)}"></div>
         ${chargeFields({ type: cfg.default_platform_type, pct: cfg.default_platform_pct, fixed: cfg.default_platform_fixed }, 'c')}
       </div>
-      <div><button class="btn primary" type="submit">Salvar padrão</button></div>
+      <div><h2>Pagamento online (Asaas)</h2><p class="note">As taxas abaixo são acrescentadas ao total do comprador conforme ele escolhe Pix ou cartão, para cobrir a tarifa do Asaas. Confira os valores do seu plano no Asaas. A taxa de split é descontada da parte do organizador.</p></div>
+      <label class="check"><input type="checkbox" name="payments_enabled" ${cfg.payments_enabled ? 'checked' : ''}> Vender com pagamento online (Pix e cartão). Desligado: o pedido é confirmado na hora e o pagamento é combinado por fora.</label>
+      <div class="formgrid">
+        <div class="field"><label for="c-pixf">Pix: tarifa fixa (R$)</label><input id="c-pixf" name="pix_fee_fixed" type="number" min="0" step="0.01" value="${esc(cfg.pix_fee_fixed ?? 0)}"></div>
+        <div class="field"><label for="c-pixp">Pix: tarifa percentual (%)</label><input id="c-pixp" name="pix_fee_pct" type="number" min="0" max="50" step="0.01" value="${esc(cfg.pix_fee_pct ?? 0)}"></div>
+        <div class="field"><label for="c-cardf">Cartão: tarifa fixa (R$)</label><input id="c-cardf" name="card_fee_fixed" type="number" min="0" step="0.01" value="${esc(cfg.card_fee_fixed ?? 0)}"></div>
+        <div class="field"><label for="c-cardp">Cartão: tarifa percentual (%)</label><input id="c-cardp" name="card_fee_pct" type="number" min="0" max="50" step="0.01" value="${esc(cfg.card_fee_pct ?? 0)}"></div>
+        <div class="field"><label for="c-split">Taxa de split por pedido (R$, paga pelo organizador)</label><input id="c-split" name="split_fee_fixed" type="number" min="0" step="0.01" value="${esc(cfg.split_fee_fixed ?? 0)}"></div>
+        <div class="field"><label for="c-res">Tempo para pagar (minutos)</label><input id="c-res" name="reservation_minutes" type="number" min="5" max="120" step="1" value="${esc(cfg.reservation_minutes ?? 15)}"></div>
+      </div>
+      <div><button class="btn primary" type="submit">Salvar configurações</button></div>
     </form>`, { 'change:ptype-fee': chargeToggle }, {
       cfg: async fd => {
         const c = readCharge(fd);
-        must(await sb.from('settings').update({ default_fee_pct: Number(fd.get('default_fee_pct')) || 0, default_platform_type: c.platform_fee_type, default_platform_pct: c.platform_pct, default_platform_fixed: c.platform_fee_fixed, updated_at: new Date().toISOString() }).eq('id', 1));
-        toast('Cobrança padrão salva.');
+        const n = k => Number(fd.get(k)) || 0;
+        must(await sb.from('settings').update({ default_fee_pct: n('default_fee_pct'), default_platform_type: c.platform_fee_type, default_platform_pct: c.platform_pct, default_platform_fixed: c.platform_fee_fixed,
+          payments_enabled: fd.get('payments_enabled') === 'on', pix_fee_fixed: n('pix_fee_fixed'), pix_fee_pct: n('pix_fee_pct'), card_fee_fixed: n('card_fee_fixed'), card_fee_pct: n('card_fee_pct'),
+          split_fee_fixed: n('split_fee_fixed'), reservation_minutes: Math.min(120, Math.max(5, Math.round(n('reservation_minutes')) || 15)), updated_at: new Date().toISOString() }).eq('id', 1));
+        toast('Configurações salvas.');
       }
     });
   }
@@ -943,14 +1096,21 @@ async function vAdmin(tab) {
   if (tab === 'organizadores') {
     const counts = must(await sb.from('events').select('organizer_id')).reduce((m, e) => { if (e.organizer_id) m[e.organizer_id] = (m[e.organizer_id] || 0) + 1; return m; }, {});
     return mount(head + `<div class="panel"><div class="row between"><h2>${num(orgs.length)} organizador${orgs.length === 1 ? '' : 'es'}</h2><a class="btn primary" href="#/admin/organizador/novo">+ Novo organizador</a></div>
-      ${orgs.length ? `<div class="tablewrap"><table><thead><tr><th>Nome / razão social</th><th>Tipo</th><th>Documento</th><th>E-mail</th><th>Conta</th><th class="num">Eventos</th><th></th></tr></thead><tbody>
+      ${orgs.length ? `<div class="tablewrap"><table><thead><tr><th>Nome / razão social</th><th>Tipo</th><th>Documento</th><th>E-mail</th><th>Conta</th><th>Recebimento online</th><th class="num">Eventos</th><th></th></tr></thead><tbody>
         ${orgs.map(o => `<tr><td><b>${esc(o.legal_name)}</b>${o.trade_name ? `<div class="note">${esc(o.trade_name)}</div>` : ''}</td><td>${o.person_type}</td><td class="mono">${esc(fmtDoc(o.person_type, o.document))}</td><td>${esc(o.email)}</td>
-          <td>${o.user_id ? '<span class="chip ok">Ativa</span>' : '<span class="chip">Aguardando cadastro</span>'}</td><td class="num">${num(counts[o.id] || 0)}</td>
+          <td>${o.user_id ? '<span class="chip ok">Ativa</span>' : '<span class="chip">Aguardando cadastro</span>'}</td>
+          <td>${o.payout_account ? '<span class="chip ok">Carteira Asaas</span>' : `<span class="chip ${cfg.payments_enabled ? 'bad' : ''}">Sem carteira</span>`}</td><td class="num">${num(counts[o.id] || 0)}</td>
           <td class="num"><a class="btn small" href="#/admin/organizador/${esc(o.id)}">Abrir</a></td></tr>`).join('')}</tbody></table></div>`
         : '<p class="note">Cadastre o primeiro organizador para poder vincular eventos.</p>'}</div>`);
   }
   const evs = must(await sb.from('events').select('id,name,starts_at,published,organizer_id,platform_pct,platform_fee_type,platform_fee_fixed,ticket_types(capacity,sold)').order('starts_at', { ascending: false }));
   const totalSold = evs.reduce((a, e) => a + (e.ticket_types || []).reduce((b, t) => b + t.sold, 0), 0);
+  const refunds = must(await sb.from('orders').select('id,code,buyer_name,buyer_email,total,paid_at,events(name)').eq('status', 'refund_needed').order('paid_at'));
+  const refundPanel = refunds.length ? `<div class="panel" style="border-color:var(--bad)"><h2>${num(refunds.length)} pagamento${refunds.length > 1 ? 's' : ''} para devolver</h2>
+    <p class="note">Estas pessoas pagaram depois de a reserva vencer e os ingressos já tinham esgotado. Faça o estorno no Asaas (Cobranças → a cobrança → Estornar) e marque aqui.</p>
+    <div class="tablewrap"><table><thead><tr><th>Pedido</th><th>Comprador</th><th>Evento</th><th class="num">Valor</th><th></th></tr></thead><tbody>
+    ${refunds.map(o => `<tr><td class="mono">${esc(o.code)}</td><td>${esc(o.buyer_name)}<div class="note">${esc(o.buyer_email)}</div></td><td>${esc(o.events?.name)}</td><td class="num">${money(o.total)}</td>
+      <td class="num"><button class="btn small" data-act="refunded" data-id="${esc(o.id)}">Marcar como devolvido</button></td></tr>`).join('')}</tbody></table></div></div>` : '';
   const orgOptions = sel => `<option value="">Sem organizador</option>` + orgs.map(o => `<option value="${esc(o.id)}" ${o.id === sel ? 'selected' : ''}>${esc(orgName(o))} (${o.person_type})</option>`).join('');
   mount(head + `
   <div class="kpis">
@@ -959,6 +1119,7 @@ async function vAdmin(tab) {
     <div class="kpi"><div class="v">${num(totalSold)}</div><div class="l">ingressos emitidos</div></div>
     <div class="kpi"><div class="v">${num(evs.filter(e => !e.organizer_id).length)}</div><div class="l">eventos sem organizador</div></div>
   </div>
+  ${refundPanel}
   <details class="panel" ${evs.length ? '' : 'open'}><summary>+ Criar evento</summary>
     <form data-form="new" class="formgrid">
       <div class="field full"><label for="n-name">Nome do evento</label><input id="n-name" name="name" required></div>
@@ -982,6 +1143,7 @@ async function vAdmin(tab) {
     </tbody></table></div>` : '<p class="note">Nenhum evento ainda.</p>'}
   </div>`, {
     'change:ptype-fee': chargeToggle,
+    refunded: async b => { const { error } = await sb.rpc('mark_refunded', { p_order: b.dataset.id }); if (error) return toast(errMsg(error), 'bad'); toast('Devolução registrada.'); vAdmin(tab); },
     'change:link': async el => {
       const { error } = await sb.from('events').update({ organizer_id: el.value || null }).eq('id', el.dataset.id);
       if (error) { toast(errMsg(error), 'bad'); return vAdmin(tab); }

@@ -1,0 +1,10 @@
+# Configuração usada pelo deploy das Edge Functions (GitHub Actions).
+project_id = "catraca"
+
+# As duas funções conferem a identidade por conta própria:
+# checkout valida a sessão do comprador; payment-webhook valida o código secreto do Asaas.
+[functions.checkout]
+verify_jwt = false
+
+[functions.payment-webhook]
+verify_jwt = false

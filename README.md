@@ -68,6 +68,36 @@ Cole os dois em [`assets/config.js`](assets/config.js) e faça commit. A chave *
 
 O site é estático (HTML, CSS e JavaScript, sem etapa de build). Em **Settings → Pages** do repositório, a fonte é **Deploy from a branch → `main` / `(root)`**. Cada commit na `main` atualiza o site em 1 ou 2 minutos.
 
+## Pagamento online (Asaas, com divisão automática)
+
+- O comprador escolhe **Pix** ou **cartão**. A tarifa do meio de pagamento é **somada ao total dele** (valores em Administração → Configurações).
+- As vagas ficam reservadas por alguns minutos (padrão 15) enquanto ele paga. Sem pagamento, voltam para a venda.
+- Quando o Asaas avisa que o pagamento caiu, o pedido é confirmado e os ingressos com QR Code aparecem.
+- A parte do organizador (vendas − cobrança da plataforma − taxa de split) vai **direto para a carteira Asaas dele** (split). O restante fica na conta da plataforma.
+- Cada organizador informa o **Wallet ID** do Asaas em "Dados cadastrais e de recebimento". Sem ele, o evento não vende online.
+- Pagamento que chega depois do prazo, com ingressos esgotados, aparece em Administração para devolução.
+
+### Peças
+
+```
+supabase/functions/checkout          cria a cobrança (chamado pelo site)
+supabase/functions/payment-webhook   recebe o aviso de pagamento do Asaas
+supabase/functions/_shared/providers  um arquivo por meio de pagamento (asaas.ts)
+.github/workflows/deploy-functions.yml publica as funções no Supabase a cada mudança
+```
+
+**Trocar de meio de pagamento no futuro:** crie `supabase/functions/_shared/providers/<nome>.ts` implementando a interface de `types.ts`, registre em `index.ts` e altere `payment_provider` na tabela `settings`. O resto do sistema (reservas, ingressos, financeiro) não muda.
+
+### Segredos no Supabase (Edge Functions → Secrets)
+
+| Nome | Valor |
+|---|---|
+| `ASAAS_API_KEY` | chave de API da conta da plataforma no Asaas |
+| `ASAAS_ENV` | `sandbox` para testes, `production` para valer |
+| `ASAAS_WEBHOOK_TOKEN` | código secreto (32+ caracteres) que você também cadastra no webhook do Asaas |
+
+Webhook no Asaas (Integrações → Webhooks): URL `https://xfrbybveoschauaaxmbk.supabase.co/functions/v1/payment-webhook?provider=asaas`, eventos de **cobrança** (PAYMENT_CONFIRMED, PAYMENT_RECEIVED, PAYMENT_OVERDUE, PAYMENT_DELETED, PAYMENT_REFUNDED).
+
 ## Dinheiro: como os valores são calculados
 
 - **Preço da meia-entrada** = metade da inteira; ela usa a mesma lotação do lote.
@@ -81,7 +111,7 @@ Os preços são recalculados no banco na hora da compra (função `buy_tickets`)
 
 ## O que ainda não faz
 
-- **Pagamento online**: o pedido é registrado e os códigos são emitidos, mas a cobrança é combinada por fora. Para cobrar no site, o próximo passo é integrar um gateway (Mercado Pago, Asaas, Pagar.me ou Stripe) por meio de uma *Edge Function* do Supabase que confirma o pedido só depois do pagamento.
+- **Parcelamento no cartão**: por enquanto só à vista.
 - **QR Code**: a validação na porta é feita digitando o código do ingresso.
 
 ## Estrutura

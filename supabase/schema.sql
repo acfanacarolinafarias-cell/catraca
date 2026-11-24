@@ -367,23 +367,116 @@ drop trigger if exists events_staff_cleanup on public.events;
 create trigger events_staff_cleanup after update on public.events
   for each row execute function public.events_staff_cleanup();
 
+-- ---------- Pagamento online: colunas ----------
+
+-- Configurações de pagamento (só a administração altera)
+alter table public.settings add column if not exists payments_enabled    boolean not null default false;
+alter table public.settings add column if not exists payment_provider    text not null default 'asaas';
+alter table public.settings add column if not exists reservation_minutes integer not null default 15;
+alter table public.settings add column if not exists pix_fee_fixed       numeric(10,2) not null default 1.99;
+alter table public.settings add column if not exists pix_fee_pct         numeric(5,2) not null default 0;
+alter table public.settings add column if not exists card_fee_fixed      numeric(10,2) not null default 0.49;
+alter table public.settings add column if not exists card_fee_pct        numeric(5,2) not null default 2.99;
+alter table public.settings add column if not exists split_fee_fixed     numeric(10,2) not null default 0;
+do $$ begin
+  alter table public.settings add constraint settings_payment_values_check check (
+    reservation_minutes between 5 and 120 and pix_fee_fixed >= 0 and card_fee_fixed >= 0
+    and split_fee_fixed >= 0 and pix_fee_pct between 0 and 50 and card_fee_pct between 0 and 50);
+exception when duplicate_object then null; end $$;
+
+-- Conta de recebimento do organizador no meio de pagamento (ex.: Wallet ID do Asaas)
+alter table public.organizers add column if not exists payout_provider text not null default 'asaas';
+alter table public.organizers add column if not exists payout_account  text not null default '';
+
+-- Situação e valores do pedido
+alter table public.orders add column if not exists status              text not null default 'confirmed';
+alter table public.orders add column if not exists expires_at          timestamptz;
+alter table public.orders add column if not exists payment_method      text not null default 'manual';
+alter table public.orders add column if not exists payment_fee         numeric(10,2) not null default 0;
+alter table public.orders add column if not exists commission          numeric(10,2) not null default 0;
+alter table public.orders add column if not exists split_fee           numeric(10,2) not null default 0;
+alter table public.orders add column if not exists organizer_amount    numeric(10,2) not null default 0;
+alter table public.orders add column if not exists provider            text;
+alter table public.orders add column if not exists provider_payment_id text;
+alter table public.orders add column if not exists provider_data       jsonb;
+alter table public.orders add column if not exists paid_at             timestamptz;
+do $$ begin
+  alter table public.orders add constraint orders_status_check
+    check (status in ('pending', 'confirmed', 'expired', 'canceled', 'refunded', 'refund_needed'));
+exception when duplicate_object then null; end $$;
+do $$ begin
+  alter table public.orders add constraint orders_payment_method_check check (payment_method in ('manual', 'pix', 'card', 'free'));
+exception when duplicate_object then null; end $$;
+create unique index if not exists orders_provider_payment_key on public.orders (provider, provider_payment_id) where provider_payment_id is not null;
+create index if not exists orders_pending_idx on public.orders (expires_at) where status = 'pending';
+
 -- ---------- Compra (atômica, com trava de lotação) ----------
 
+-- Taxa do meio de pagamento repassada ao comprador: o total é calculado para que,
+-- depois da tarifa (fixo + %), sobre exatamente o valor base.
+create or replace function public.payment_fee_for(p_base numeric, p_method text) returns numeric
+language plpgsql stable security definer set search_path = public as $$
+declare
+  cfg public.settings%rowtype;
+  f numeric; p numeric;
+begin
+  if p_base <= 0 or p_method not in ('pix', 'card') then return 0; end if;
+  select * into cfg from public.settings where id = 1;
+  f := case p_method when 'pix' then cfg.pix_fee_fixed else cfg.card_fee_fixed end;
+  p := case p_method when 'pix' then cfg.pix_fee_pct else cfg.card_fee_pct end;
+  return ceil(((p_base + f) / (1 - p / 100) - p_base) * 100) / 100;
+end $$;
+
+-- Devolve as vagas de um pedido ao estoque
+create or replace function public.release_order_seats(p_order uuid) returns void
+language sql security definer set search_path = public as $$
+  update public.ticket_types tt set sold = greatest(tt.sold - x.qty, 0)
+  from (select ticket_type_id, count(*)::int as qty from public.tickets where order_id = p_order group by 1) x
+  where tt.id = x.ticket_type_id;
+$$;
+
+-- Reservas vencidas sem pagamento: libera as vagas
+create or replace function public.release_expired(p_event uuid default null) returns integer
+language plpgsql security definer set search_path = public as $$
+declare
+  o record; n integer := 0;
+begin
+  for o in
+    select id from public.orders
+    where status = 'pending' and expires_at < now() and (p_event is null or event_id = p_event)
+    for update skip locked
+  loop
+    perform public.release_order_seats(o.id);
+    update public.orders set status = 'expired' where id = o.id;
+    n := n + 1;
+  end loop;
+  return n;
+end $$;
+
+drop function if exists public.buy_tickets(uuid, jsonb, text, text);
 create or replace function public.buy_tickets(
-  p_event uuid, p_items jsonb, p_buyer_name text, p_buyer_email text default ''
+  p_event uuid, p_items jsonb, p_buyer_name text, p_buyer_email text default '', p_method text default null
 ) returns uuid
 language plpgsql security definer set search_path = public as $$
 declare
   v_uid      uuid := auth.uid();
+  cfg        public.settings%rowtype;
   v_event    public.events%rowtype;
   v_type     public.ticket_types%rowtype;
+  v_wallet   text := '';
   r          record;
   v_order    uuid;
   v_code     text;
   v_unit     numeric(10,2);
   v_subtotal numeric(10,2) := 0;
   v_fee      numeric(10,2);
+  v_payfee   numeric(10,2) := 0;
+  v_comm     numeric(10,2);
+  v_split    numeric(10,2) := 0;
+  v_orgamt   numeric(10,2) := 0;
   v_n        integer := 0;
+  v_online   boolean;
+  v_method   text;
 begin
   if v_uid is null then
     raise exception 'Entre na sua conta para comprar.';
@@ -395,6 +488,9 @@ begin
     raise exception 'Escolha pelo menos um ingresso.';
   end if;
 
+  select * into cfg from public.settings where id = 1;
+  v_online := coalesce(cfg.payments_enabled, false);
+
   select * into v_event from public.events where id = p_event and published;
   if not found then
     raise exception 'Este evento não está à venda.';
@@ -402,6 +498,20 @@ begin
   if v_event.starts_at < now() - interval '6 hours' then
     raise exception 'As vendas deste evento foram encerradas.';
   end if;
+  if v_online then
+    if coalesce(p_method, '') not in ('pix', 'card') then
+      raise exception 'Escolha a forma de pagamento: Pix ou cartão.';
+    end if;
+    if v_event.organizer_id is not null then
+      select coalesce(payout_account, '') into v_wallet from public.organizers where id = v_event.organizer_id;
+      if v_wallet = '' then
+        raise exception 'Este evento ainda não está habilitado para pagamento online. Avise quem organiza.';
+      end if;
+    end if;
+  end if;
+
+  -- Reservas vencidas deste evento voltam para a venda
+  perform public.release_expired(p_event);
 
   -- Trava e confere cada lote (inteira + meia somadas)
   for r in
@@ -455,11 +565,104 @@ begin
     v_subtotal := v_subtotal + v_unit * r.qty;
   end loop;
 
-  v_fee := round(v_subtotal * v_event.fee_pct / 100, 2);
-  update public.orders set subtotal = v_subtotal, fee = v_fee, total = v_subtotal + v_fee
-  where id = v_order;
+  v_fee  := round(v_subtotal * v_event.fee_pct / 100, 2);
+  v_comm := case when v_event.platform_fee_type = 'fixed'
+                 then round(v_n * v_event.platform_fee_fixed, 2)
+                 else round(v_subtotal * v_event.platform_pct / 100, 2) end;
+  if v_event.organizer_id is not null then
+    v_split  := case when v_online then cfg.split_fee_fixed else 0 end;
+    v_orgamt := greatest(v_subtotal - v_comm - v_split, 0);
+  end if;
+
+  if v_online and v_subtotal + v_fee > 0 then
+    v_method := p_method;
+    v_payfee := public.payment_fee_for(v_subtotal + v_fee, p_method);
+    update public.orders set
+      subtotal = v_subtotal, fee = v_fee, payment_fee = v_payfee, total = v_subtotal + v_fee + v_payfee,
+      commission = v_comm, split_fee = v_split, organizer_amount = v_orgamt,
+      payment_method = v_method, status = 'pending',
+      expires_at = now() + make_interval(mins => coalesce(cfg.reservation_minutes, 15))
+    where id = v_order;
+  else
+    update public.orders set
+      subtotal = v_subtotal, fee = v_fee, total = v_subtotal + v_fee,
+      commission = v_comm, split_fee = 0, organizer_amount = v_orgamt,
+      payment_method = case when v_online then 'free' else 'manual' end,
+      status = 'confirmed', paid_at = now()
+    where id = v_order;
+  end if;
 
   return v_order;
+end $$;
+
+-- ---------- Retorno do meio de pagamento (chamado só pelo servidor) ----------
+
+-- Pagamento aprovado. Idempotente: avisos repetidos não fazem nada.
+create or replace function public.confirm_payment(p_provider text, p_payment_id text) returns text
+language plpgsql security definer set search_path = public as $$
+declare
+  o public.orders%rowtype;
+  r record;
+begin
+  select * into o from public.orders
+    where provider = p_provider and provider_payment_id = p_payment_id for update;
+  if not found then return 'unknown'; end if;
+  if o.status in ('confirmed', 'refund_needed', 'refunded') then return o.status; end if;
+
+  if o.status in ('expired', 'canceled') then
+    -- Pagou depois de a reserva vencer: tenta reservar de novo
+    for r in
+      select t.ticket_type_id, count(*)::int as qty from public.tickets t
+      where t.order_id = o.id group by 1 order by 1
+    loop
+      if not exists (select 1 from public.ticket_types
+                     where id = r.ticket_type_id and sold + r.qty <= capacity) then
+        update public.orders set status = 'refund_needed', paid_at = now() where id = o.id;
+        return 'refund_needed';
+      end if;
+    end loop;
+    for r in
+      select t.ticket_type_id, count(*)::int as qty from public.tickets t
+      where t.order_id = o.id group by 1 order by 1
+    loop
+      update public.ticket_types set sold = sold + r.qty where id = r.ticket_type_id;
+    end loop;
+  end if;
+
+  update public.orders set status = 'confirmed', paid_at = now() where id = o.id;
+  return 'confirmed';
+end $$;
+
+-- Cobrança cancelada, vencida ou estornada
+create or replace function public.fail_payment(p_provider text, p_payment_id text, p_reason text) returns text
+language plpgsql security definer set search_path = public as $$
+declare
+  o public.orders%rowtype;
+begin
+  select * into o from public.orders
+    where provider = p_provider and provider_payment_id = p_payment_id for update;
+  if not found then return 'unknown'; end if;
+  if p_reason = 'refunded' and o.status in ('confirmed', 'refund_needed') then
+    if o.status = 'confirmed' then perform public.release_order_seats(o.id); end if;
+    update public.orders set status = 'refunded' where id = o.id;
+    return 'refunded';
+  end if;
+  if o.status = 'pending' then
+    perform public.release_order_seats(o.id);
+    update public.orders set status = 'canceled' where id = o.id;
+    return 'canceled';
+  end if;
+  return o.status;
+end $$;
+
+-- Administração marca que devolveu o dinheiro de um pedido pago fora do prazo
+create or replace function public.mark_refunded(p_order uuid) returns void
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_admin() then
+    raise exception 'Somente a administração registra devoluções.';
+  end if;
+  update public.orders set status = 'refunded' where id = p_order and status = 'refund_needed';
 end $$;
 
 -- ---------- Validação na entrada ----------
@@ -481,6 +684,9 @@ begin
     return jsonb_build_object('status', 'other_event');
   end if;
   select * into o from public.orders where id = t.order_id;
+  if o.status <> 'confirmed' then
+    return jsonb_build_object('status', 'not_paid', 'code', t.code, 'order_status', o.status);
+  end if;
   if t.checked_in_at is not null then
     return jsonb_build_object('status', 'used', 'at', t.checked_in_at, 'buyer', o.buyer_name,
                               'type', t.type_name, 'kind', t.kind, 'code', t.code);
@@ -490,7 +696,7 @@ begin
                             'kind', t.kind, 'code', t.code);
 end $$;
 
--- Contagem da entrada e últimas validações (sem e-mails nem valores)
+-- Contagem da entrada e últimas validações (sem e-mails nem valores; só pedidos pagos)
 create or replace function public.checkin_stats(p_event uuid) returns jsonb
 language plpgsql stable security definer set search_path = public as $$
 begin
@@ -498,8 +704,10 @@ begin
     raise exception 'Você não tem permissão para ver a entrada deste evento.';
   end if;
   return jsonb_build_object(
-    'total', (select count(*) from public.tickets where event_id = p_event),
-    'used',  (select count(*) from public.tickets where event_id = p_event and checked_in_at is not null),
+    'total', (select count(*) from public.tickets t join public.orders o on o.id = t.order_id
+              where t.event_id = p_event and o.status = 'confirmed'),
+    'used',  (select count(*) from public.tickets t join public.orders o on o.id = t.order_id
+              where t.event_id = p_event and o.status = 'confirmed' and t.checked_in_at is not null),
     'recent', coalesce((
       select jsonb_agg(r order by r.at desc) from (
         select t.code, o.buyer_name as buyer, t.type_name as type, t.kind, t.checked_in_at as at
@@ -570,7 +778,8 @@ create policy orders_select on public.orders for select
 drop policy if exists tickets_select on public.tickets;
 create policy tickets_select on public.tickets for select
   using (
-    exists (select 1 from public.orders o where o.id = order_id and o.buyer_id = auth.uid())
+    exists (select 1 from public.orders o
+            where o.id = order_id and o.buyer_id = auth.uid() and o.status = 'confirmed')
     or public.can_manage_event(event_id)
   );
 
@@ -620,8 +829,10 @@ grant select on public.events, public.ticket_types to anon, authenticated;
 grant select, update (full_name) on public.profiles to authenticated;
 grant select, insert, update, delete on public.organizers to authenticated;
 grant insert, update, delete on public.events to authenticated;
-grant select on public.settings to authenticated;
-grant update (default_fee_pct, default_platform_type, default_platform_pct, default_platform_fixed, updated_at)
+grant select on public.settings to anon, authenticated;
+grant update (default_fee_pct, default_platform_type, default_platform_pct, default_platform_fixed, updated_at,
+              payments_enabled, reservation_minutes, pix_fee_fixed, pix_fee_pct, card_fee_fixed, card_fee_pct,
+              split_fee_fixed)
   on public.settings to authenticated;
 grant insert (id, event_id, name, price, capacity, allows_half, sort),
       update (name, price, capacity, allows_half, sort),
@@ -631,8 +842,19 @@ grant select, insert, update, delete on public.expenses to authenticated;
 grant select, insert (id, organizer_id, name, email), update (name, email), delete on public.staff to authenticated;
 grant select, insert, delete on public.staff_events to authenticated;
 
-revoke execute on function public.buy_tickets(uuid, jsonb, text, text) from public, anon;
-grant execute on function public.buy_tickets(uuid, jsonb, text, text) to authenticated;
+revoke execute on function public.buy_tickets(uuid, jsonb, text, text, text) from public, anon;
+grant execute on function public.buy_tickets(uuid, jsonb, text, text, text) to authenticated;
+revoke execute on function public.release_expired(uuid) from public, anon;
+grant execute on function public.release_expired(uuid) to authenticated;
+revoke execute on function public.mark_refunded(uuid) from public, anon;
+grant execute on function public.mark_refunded(uuid) to authenticated;
+-- Só o servidor (Edge Functions, com a chave secreta) confirma ou cancela pagamentos
+revoke execute on function public.confirm_payment(text, text) from public, anon, authenticated;
+revoke execute on function public.fail_payment(text, text, text) from public, anon, authenticated;
+revoke execute on function public.release_order_seats(uuid) from public, anon, authenticated;
+revoke execute on function public.payment_fee_for(numeric, text) from public, anon, authenticated;
+grant execute on function public.confirm_payment(text, text) to service_role;
+grant execute on function public.fail_payment(text, text, text) to service_role;
 revoke execute on function public.check_in(text, uuid) from public, anon;
 grant execute on function public.check_in(text, uuid) to authenticated;
 revoke execute on function public.checkin_stats(uuid) from public, anon;
