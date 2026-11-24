@@ -64,6 +64,27 @@ create table if not exists public.events (
 );
 create index if not exists events_organizer_idx on public.events (organizer_id);
 
+-- Cobrança da plataforma: percentual sobre as vendas (padrão) ou valor fixo por ingresso
+alter table public.events add column if not exists platform_fee_type text not null default 'percent';
+alter table public.events add column if not exists platform_fee_fixed numeric(10,2) not null default 0;
+do $$ begin
+  alter table public.events add constraint events_platform_fee_type_check check (platform_fee_type in ('percent', 'fixed'));
+exception when duplicate_object then null; end $$;
+do $$ begin
+  alter table public.events add constraint events_platform_fee_fixed_check check (platform_fee_fixed >= 0);
+exception when duplicate_object then null; end $$;
+
+-- Configurações da plataforma (uma linha só). Valores padrão para eventos novos.
+create table if not exists public.settings (
+  id                    integer primary key default 1 check (id = 1),
+  default_fee_pct       numeric(5,2) not null default 10 check (default_fee_pct between 0 and 30),
+  default_platform_type text not null default 'percent' check (default_platform_type in ('percent', 'fixed')),
+  default_platform_pct  numeric(5,2) not null default 5 check (default_platform_pct between 0 and 100),
+  default_platform_fixed numeric(10,2) not null default 0 check (default_platform_fixed >= 0),
+  updated_at            timestamptz not null default now()
+);
+insert into public.settings (id) values (1) on conflict (id) do nothing;
+
 create table if not exists public.ticket_types (
   id           uuid primary key default gen_random_uuid(),
   event_id     uuid not null references public.events(id) on delete cascade,
@@ -273,21 +294,36 @@ drop trigger if exists organizers_guard on public.organizers;
 create trigger organizers_guard before insert or update on public.organizers
   for each row execute function public.organizers_guard();
 
--- Organizador não troca o dono do evento nem a comissão da plataforma.
+-- Cobranças da plataforma (taxa de serviço e comissão) e o dono do evento:
+-- só a administração define. Evento criado por organizador recebe os padrões.
 create or replace function public.events_guard() returns trigger
 language plpgsql security definer set search_path = public as $$
+declare
+  cfg public.settings%rowtype;
 begin
-  if auth.uid() is not null and not public.is_admin() then
-    if new.organizer_id is distinct from old.organizer_id
-       or new.platform_pct is distinct from old.platform_pct then
-      raise exception 'Somente a administração altera o organizador e a comissão da plataforma.';
-    end if;
+  if auth.uid() is null or public.is_admin() then
+    return new;
+  end if;
+  if tg_op = 'INSERT' then
+    select * into cfg from public.settings where id = 1;
+    new.fee_pct            := coalesce(cfg.default_fee_pct, 10);
+    new.platform_fee_type  := coalesce(cfg.default_platform_type, 'percent');
+    new.platform_pct       := coalesce(cfg.default_platform_pct, 0);
+    new.platform_fee_fixed := coalesce(cfg.default_platform_fixed, 0);
+    return new;
+  end if;
+  if new.organizer_id is distinct from old.organizer_id
+     or new.platform_pct is distinct from old.platform_pct
+     or new.platform_fee_type is distinct from old.platform_fee_type
+     or new.platform_fee_fixed is distinct from old.platform_fee_fixed
+     or new.fee_pct is distinct from old.fee_pct then
+    raise exception 'Somente a administração altera o organizador, a taxa de serviço e a cobrança da plataforma.';
   end if;
   return new;
 end $$;
 
 drop trigger if exists events_guard on public.events;
-create trigger events_guard before update on public.events
+create trigger events_guard before insert or update on public.events
   for each row execute function public.events_guard();
 
 -- Portaria: e-mail normalizado; a conta é vinculada só pelo sistema.
@@ -485,6 +521,7 @@ alter table public.tickets      enable row level security;
 alter table public.expenses     enable row level security;
 alter table public.staff        enable row level security;
 alter table public.staff_events enable row level security;
+alter table public.settings     enable row level security;
 
 drop policy if exists profiles_select on public.profiles;
 create policy profiles_select on public.profiles for select
@@ -508,16 +545,16 @@ create policy organizers_delete on public.organizers for delete
 
 drop policy if exists events_select on public.events;
 create policy events_select on public.events for select
-  using (published or public.can_manage_event(id) or public.is_event_staff(id));
+  using (published or public.is_admin() or public.owns_organizer(organizer_id) or public.is_event_staff(id));
 drop policy if exists events_insert on public.events;
 create policy events_insert on public.events for insert
-  with check (public.is_admin());
+  with check (public.is_admin() or (organizer_id is not null and public.owns_organizer(organizer_id)));
 drop policy if exists events_update on public.events;
 create policy events_update on public.events for update
-  using (public.can_manage_event(id));
+  using (public.is_admin() or public.owns_organizer(organizer_id));
 drop policy if exists events_delete on public.events;
 create policy events_delete on public.events for delete
-  using (public.is_admin());
+  using (public.is_admin() or public.owns_organizer(organizer_id));
 
 drop policy if exists ticket_types_select on public.ticket_types;
 create policy ticket_types_select on public.ticket_types for select
@@ -565,18 +602,27 @@ create policy staff_events_delete on public.staff_events for delete
       and (public.is_admin() or public.owns_organizer(s.organizer_id))
   ));
 
+drop policy if exists settings_select on public.settings;
+create policy settings_select on public.settings for select using (true);
+drop policy if exists settings_update on public.settings;
+create policy settings_update on public.settings for update
+  using (public.is_admin()) with check (public.is_admin());
+
 -- ---------- Privilégios por coluna ----------
 -- Pedidos e ingressos só são criados pelas funções acima; "sold" e "role"
 -- não podem ser alterados direto pelo navegador.
 
 revoke all on public.profiles, public.organizers, public.events, public.ticket_types,
               public.orders, public.tickets, public.expenses,
-              public.staff, public.staff_events from anon, authenticated;
+              public.staff, public.staff_events, public.settings from anon, authenticated;
 
 grant select on public.events, public.ticket_types to anon, authenticated;
 grant select, update (full_name) on public.profiles to authenticated;
 grant select, insert, update, delete on public.organizers to authenticated;
 grant insert, update, delete on public.events to authenticated;
+grant select on public.settings to authenticated;
+grant update (default_fee_pct, default_platform_type, default_platform_pct, default_platform_fixed, updated_at)
+  on public.settings to authenticated;
 grant insert (id, event_id, name, price, capacity, allows_half, sort),
       update (name, price, capacity, allows_half, sort),
       delete on public.ticket_types to authenticated;

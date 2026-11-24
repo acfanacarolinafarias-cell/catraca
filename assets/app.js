@@ -40,6 +40,21 @@ function fmtDoc(type, v) {
   return c;
 }
 const orgName = o => o ? (o.trade_name || o.legal_name) : '';
+const fmtCharge = ev => ev.platform_fee_type === 'fixed' ? `${money(ev.platform_fee_fixed)} por ingresso vendido` : `${num(ev.platform_pct)}% sobre as vendas`;
+const getSettings = async () => (await sb.from('settings').select('*').eq('id', 1).maybeSingle()).data
+  || { default_fee_pct: 10, default_platform_type: 'percent', default_platform_pct: 5, default_platform_fixed: 0 };
+// Campos de cobrança da plataforma (só a administração vê e edita)
+function chargeFields(v, idp) {
+  const fixed = v.type === 'fixed';
+  return `<div class="field"><label for="${idp}-ptype">Cobrança da plataforma</label>
+      <select id="${idp}-ptype" name="platform_fee_type" data-change="ptype-fee">
+        <option value="percent" ${fixed ? '' : 'selected'}>Percentual sobre as vendas</option>
+        <option value="fixed" ${fixed ? 'selected' : ''}>Valor fixo por ingresso vendido</option></select></div>
+    <div class="field" data-fee="percent" ${fixed ? 'hidden' : ''}><label for="${idp}-ppct">Percentual da plataforma (%)</label><input id="${idp}-ppct" name="platform_pct" type="number" min="0" max="100" step="0.5" value="${esc(v.pct)}"></div>
+    <div class="field" data-fee="fixed" ${fixed ? '' : 'hidden'}><label for="${idp}-pfix">Valor por ingresso (R$)</label><input id="${idp}-pfix" name="platform_fee_fixed" type="number" min="0" step="0.01" value="${esc(v.fixed)}"></div>`;
+}
+const chargeToggle = el => { const f = el.closest('form'); f.querySelectorAll('[data-fee]').forEach(x => { x.hidden = x.dataset.fee !== el.value; }); };
+const readCharge = fd => ({ platform_fee_type: fd.get('platform_fee_type') === 'fixed' ? 'fixed' : 'percent', platform_pct: Number(fd.get('platform_pct')) || 0, platform_fee_fixed: Number(fd.get('platform_fee_fixed')) || 0 });
 
 /* ---------- QR Code ---------- */
 const loadScript = (src, name) => window[name] ? Promise.resolve(window[name]) : new Promise((res, rej) => {
@@ -452,12 +467,34 @@ async function vPanel() {
     if (isAdmin()) return go('#/admin');
     return vMessage('Nenhum evento vinculado', 'Quando a administração vincular um evento ao seu e-mail, ele aparece aqui.');
   }
-  const evs = must(await sb.from('events').select(EV_PUBLIC + ',organizer_id').in('organizer_id', ids).order('starts_at', { ascending: false }));
+  const [evs, cfg] = await Promise.all([
+    sb.from('events').select(EV_PUBLIC + ',organizer_id').in('organizer_id', ids).order('starts_at', { ascending: false }).then(must),
+    getSettings()
+  ]);
+  const charge = fmtCharge({ platform_fee_type: cfg.default_platform_type, platform_pct: cfg.default_platform_pct, platform_fee_fixed: cfg.default_platform_fixed });
   mount(`<div class="page-head"><div><div class="eyebrow">${esc(me.organizers.map(orgName).join(' · '))}</div><h1>Meus eventos</h1>
-      <p>Edite as informações, os lotes e acompanhe vendas, despesas e entradas de cada evento.</p></div>
+      <p>Crie eventos, edite informações e lotes, e acompanhe vendas, despesas e entradas.</p></div>
       <div class="row"><a class="btn" href="#/painel/equipe">Equipe de portaria</a><a class="btn" href="#/painel/dados">Dados cadastrais e de recebimento</a></div></div>
+    <details class="panel" ${evs.length ? '' : 'open'}><summary>+ Criar evento</summary>
+      <form data-form="new" class="formgrid">
+        <div class="field full"><label for="pn-name">Nome do evento</label><input id="pn-name" name="name" required></div>
+        <div class="field"><label for="pn-date">Data e hora</label><input id="pn-date" name="starts_at" type="datetime-local" required></div>
+        ${me.organizers.length > 1 ? `<div class="field"><label for="pn-org">Organizador</label><select id="pn-org" name="organizer_id">${me.organizers.map(o => `<option value="${esc(o.id)}">${esc(orgName(o))}</option>`).join('')}</select></div>` : `<input type="hidden" name="organizer_id" value="${esc(ids[0])}">`}
+        <div class="field"><label for="pn-venue">Local</label><input id="pn-venue" name="venue"></div>
+        <div class="field"><label for="pn-city">Cidade / UF</label><input id="pn-city" name="city"></div>
+        <p class="note full">Cobranças definidas pela plataforma: taxa de serviço de ${num(cfg.default_fee_pct)}% paga pelo comprador e ${esc(charge)}.</p>
+        <div class="full row"><button class="btn primary" type="submit">Criar e configurar lotes</button><span class="note">O evento nasce como rascunho. Publique depois de cadastrar os lotes.</span></div>
+      </form>
+    </details>
     ${evs.length ? `<div class="grid">${evs.map(ev => ticketCard(ev, `#/painel/evento/${ev.id}/info`)).join('')}</div>`
-      : '<div class="empty"><h2>Nenhum evento vinculado ainda</h2><p>A administração cria o evento e o vincula a você.</p></div>'}`);
+      : '<div class="empty"><h2>Nenhum evento ainda</h2><p>Crie o primeiro evento acima.</p></div>'}`, {}, {
+    new: async fd => {
+      const starts = fromLocalInput(fd.get('starts_at'));
+      if (!starts) return toast('Informe a data e a hora.', 'bad');
+      const ev = must(await sb.from('events').insert({ name: String(fd.get('name')).trim(), starts_at: starts, organizer_id: fd.get('organizer_id'), venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim() }).select('id').single());
+      toast('Evento criado. Agora cadastre os lotes.'); go(`#/painel/evento/${ev.id}/lotes`);
+    }
+  });
 }
 
 async function vOrgData() {
@@ -526,31 +563,32 @@ async function mInfo(ev, header, reload, admin) {
     <div class="formgrid">
       <div class="field full"><label for="e-name">Nome do evento</label><input id="e-name" name="name" required value="${esc(ev.name)}"></div>
       <div class="field"><label for="e-date">Data e hora</label><input id="e-date" name="starts_at" type="datetime-local" required value="${esc(toLocalInput(ev.starts_at))}"></div>
-      <div class="field"><label for="e-fee">Taxa de serviço cobrada do comprador (%)</label><input id="e-fee" name="fee_pct" type="number" min="0" max="30" step="0.5" value="${esc(ev.fee_pct)}"></div>
+      ${admin ? `<div class="field"><label for="e-fee">Taxa de serviço cobrada do comprador (%)</label><input id="e-fee" name="fee_pct" type="number" min="0" max="30" step="0.5" value="${esc(ev.fee_pct)}"></div>` : ''}
       <div class="field"><label for="e-venue">Local</label><input id="e-venue" name="venue" value="${esc(ev.venue)}"></div>
       <div class="field"><label for="e-city">Cidade / UF</label><input id="e-city" name="city" value="${esc(ev.city)}"></div>
       <div class="field full"><label for="e-desc">Descrição</label><textarea id="e-desc" name="description" rows="5">${esc(ev.description)}</textarea></div>
       ${admin ? `
       <div class="field"><label for="e-org">Organizador responsável</label><select id="e-org" name="organizer_id"><option value="">Sem organizador</option>${orgs.map(o => `<option value="${esc(o.id)}" ${o.id === ev.organizer_id ? 'selected' : ''}>${esc(orgName(o))} (${o.person_type})</option>`).join('')}</select></div>
-      <div class="field"><label for="e-plat">Comissão da plataforma sobre as vendas (%)</label><input id="e-plat" name="platform_pct" type="number" min="0" max="100" step="0.5" value="${esc(ev.platform_pct)}"></div>`
-      : `<p class="note full">Comissão da plataforma: ${num(ev.platform_pct)}% sobre as vendas (definida pela administração).</p>`}
+      ${chargeFields({ type: ev.platform_fee_type, pct: ev.platform_pct, fixed: ev.platform_fee_fixed }, 'e')}`
+      : `<p class="note full">Cobranças definidas pela plataforma: taxa de serviço de ${num(ev.fee_pct)}% paga pelo comprador e ${esc(fmtCharge(ev))}. Só a administração altera.</p>`}
       <label class="check full"><input type="checkbox" name="published" ${ev.published ? 'checked' : ''}> Publicado: aparece na vitrine e aceita compras</label>
     </div>
     <div class="row between"><button class="btn primary" type="submit">Salvar informações</button>
-      ${admin ? '<button class="btn danger" type="button" data-act="del">Excluir evento</button>' : ''}</div>
+      <button class="btn danger" type="button" data-act="del">Excluir evento</button></div>
   </form>`, {
+    'change:ptype-fee': chargeToggle,
     del: async b => {
       if (!armed) { armed = true; b.classList.add('armed'); b.textContent = 'Clique de novo para excluir'; return; }
       const { error } = await sb.from('events').delete().eq('id', ev.id);
-      if (error) return toast(errMsg(error), 'bad');
-      toast('Evento excluído.'); go('#/admin/eventos');
+      if (error) return toast(/foreign key/i.test(error.message) ? 'Este evento já tem ingressos vendidos e não pode ser excluído. Despublique para encerrar as vendas.' : errMsg(error), 'bad');
+      toast('Evento excluído.'); go(admin ? '#/admin/eventos' : '#/painel');
     }
   }, {
     info: async fd => {
       const starts = fromLocalInput(fd.get('starts_at'));
       if (!starts) return toast('Informe a data e a hora.', 'bad');
-      const body = { name: String(fd.get('name')).trim(), starts_at: starts, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), description: String(fd.get('description')).trim(), fee_pct: Number(fd.get('fee_pct')) || 0, published: fd.get('published') === 'on' };
-      if (admin) { body.organizer_id = fd.get('organizer_id') || null; body.platform_pct = Number(fd.get('platform_pct')) || 0; }
+      const body = { name: String(fd.get('name')).trim(), starts_at: starts, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), description: String(fd.get('description')).trim(), published: fd.get('published') === 'on' };
+      if (admin) Object.assign(body, { organizer_id: fd.get('organizer_id') || null, fee_pct: Number(fd.get('fee_pct')) || 0 }, readCharge(fd));
       if (body.published && !(ev.ticket_types || []).length) toast('Lembre de cadastrar os lotes na aba “Lotes”.');
       must(await sb.from('events').update(body).eq('id', ev.id));
       toast('Informações salvas.'); reload();
@@ -600,7 +638,9 @@ async function mFinance(ev, header, reload) {
   ]);
   const sales = orders.reduce((a, o) => a + Number(o.subtotal), 0);
   const fees = orders.reduce((a, o) => a + Number(o.fee), 0);
-  const commission = Math.round(sales * Number(ev.platform_pct)) / 100;
+  const commission = ev.platform_fee_type === 'fixed'
+    ? Math.round(tickets.length * Number(ev.platform_fee_fixed) * 100) / 100
+    : Math.round(sales * Number(ev.platform_pct)) / 100;
   const payout = sales - commission;
   const expTotal = expenses.reduce((a, x) => a + Number(x.amount), 0);
   const expOpen = expenses.filter(x => !x.paid).reduce((a, x) => a + Number(x.amount), 0);
@@ -613,7 +653,7 @@ async function mFinance(ev, header, reload) {
   mount(header + `
   <div class="kpis">
     <div class="kpi"><div class="v">${money(sales)}</div><div class="l">vendas de ingressos (${num(tickets.length)} emitidos)</div></div>
-    <div class="kpi"><div class="v">${money(commission)}</div><div class="l">comissão da plataforma (${num(ev.platform_pct)}%)</div></div>
+    <div class="kpi"><div class="v">${money(commission)}</div><div class="l">cobrança da plataforma (${esc(fmtCharge(ev))})</div></div>
     <div class="kpi strong"><div class="v">${money(payout)}</div><div class="l">repasse previsto ao organizador</div></div>
     <div class="kpi"><div class="v">${money(expTotal)}</div><div class="l">despesas lançadas (${money(expOpen)} a pagar)</div></div>
     <div class="kpi strong"><div class="v" style="color:${result < 0 ? 'var(--bad)' : 'var(--ok)'}">${money(result)}</div><div class="l">resultado (repasse − despesas)</div></div>
@@ -881,7 +921,24 @@ async function vAdmin(tab) {
   loading();
   const head = `<div class="page-head"><div><div class="eyebrow">Administração geral</div><h1>Administração</h1>
     <p>Crie eventos, cadastre organizadores (pessoa física ou jurídica) e vincule cada evento a quem vai gerenciá-lo.</p></div></div>
-    <nav class="subtabs"><a href="#/admin/eventos" ${tab === 'eventos' ? 'aria-current="page"' : ''}>Eventos</a><a href="#/admin/organizadores" ${tab === 'organizadores' ? 'aria-current="page"' : ''}>Organizadores</a></nav>`;
+    <nav class="subtabs"><a href="#/admin/eventos" ${tab === 'eventos' ? 'aria-current="page"' : ''}>Eventos</a><a href="#/admin/organizadores" ${tab === 'organizadores' ? 'aria-current="page"' : ''}>Organizadores</a><a href="#/admin/configuracoes" ${tab === 'configuracoes' ? 'aria-current="page"' : ''}>Configurações</a></nav>`;
+  const cfg = await getSettings();
+  if (tab === 'configuracoes') {
+    return mount(head + `<form class="panel medium" data-form="cfg">
+      <div><h2>Cobrança padrão da plataforma</h2><p class="note">Vale para os eventos que os organizadores criarem e vem preenchida quando você cria um evento. Eventos que já existem não mudam; ajuste cada um em Gerenciar → Informações. Só a administração altera esses valores.</p></div>
+      <div class="formgrid">
+        <div class="field full"><label for="c-fee">Taxa de serviço paga pelo comprador (%)</label><input id="c-fee" name="default_fee_pct" type="number" min="0" max="30" step="0.5" value="${esc(cfg.default_fee_pct)}"></div>
+        ${chargeFields({ type: cfg.default_platform_type, pct: cfg.default_platform_pct, fixed: cfg.default_platform_fixed }, 'c')}
+      </div>
+      <div><button class="btn primary" type="submit">Salvar padrão</button></div>
+    </form>`, { 'change:ptype-fee': chargeToggle }, {
+      cfg: async fd => {
+        const c = readCharge(fd);
+        must(await sb.from('settings').update({ default_fee_pct: Number(fd.get('default_fee_pct')) || 0, default_platform_type: c.platform_fee_type, default_platform_pct: c.platform_pct, default_platform_fixed: c.platform_fee_fixed, updated_at: new Date().toISOString() }).eq('id', 1));
+        toast('Cobrança padrão salva.');
+      }
+    });
+  }
   const orgs = must(await sb.from('organizers').select('*').order('legal_name'));
   if (tab === 'organizadores') {
     const counts = must(await sb.from('events').select('organizer_id')).reduce((m, e) => { if (e.organizer_id) m[e.organizer_id] = (m[e.organizer_id] || 0) + 1; return m; }, {});
@@ -892,7 +949,7 @@ async function vAdmin(tab) {
           <td class="num"><a class="btn small" href="#/admin/organizador/${esc(o.id)}">Abrir</a></td></tr>`).join('')}</tbody></table></div>`
         : '<p class="note">Cadastre o primeiro organizador para poder vincular eventos.</p>'}</div>`);
   }
-  const evs = must(await sb.from('events').select('id,name,starts_at,published,organizer_id,platform_pct,ticket_types(capacity,sold)').order('starts_at', { ascending: false }));
+  const evs = must(await sb.from('events').select('id,name,starts_at,published,organizer_id,platform_pct,platform_fee_type,platform_fee_fixed,ticket_types(capacity,sold)').order('starts_at', { ascending: false }));
   const totalSold = evs.reduce((a, e) => a + (e.ticket_types || []).reduce((b, t) => b + t.sold, 0), 0);
   const orgOptions = sel => `<option value="">Sem organizador</option>` + orgs.map(o => `<option value="${esc(o.id)}" ${o.id === sel ? 'selected' : ''}>${esc(orgName(o))} (${o.person_type})</option>`).join('');
   mount(head + `
@@ -909,20 +966,22 @@ async function vAdmin(tab) {
       <div class="field"><label for="n-org">Vincular ao organizador</label><select id="n-org" name="organizer_id">${orgOptions('')}</select></div>
       <div class="field"><label for="n-venue">Local</label><input id="n-venue" name="venue"></div>
       <div class="field"><label for="n-city">Cidade / UF</label><input id="n-city" name="city"></div>
-      <div class="field"><label for="n-fee">Taxa de serviço (%)</label><input id="n-fee" name="fee_pct" type="number" min="0" max="30" step="0.5" value="10"></div>
-      <div class="field"><label for="n-plat">Comissão da plataforma (%)</label><input id="n-plat" name="platform_pct" type="number" min="0" max="100" step="0.5" value="5"></div>
+      <div class="field"><label for="n-fee">Taxa de serviço paga pelo comprador (%)</label><input id="n-fee" name="fee_pct" type="number" min="0" max="30" step="0.5" value="${esc(cfg.default_fee_pct)}"></div>
+      ${chargeFields({ type: cfg.default_platform_type, pct: cfg.default_platform_pct, fixed: cfg.default_platform_fixed }, 'n')}
       <div class="full row"><button class="btn primary" type="submit">Criar e configurar lotes</button><span class="note">O evento nasce como rascunho. Publique depois de cadastrar os lotes.</span></div>
     </form>
   </details>
   <div class="panel"><h2>Eventos</h2>
-    ${evs.length ? `<div class="tablewrap"><table><thead><tr><th>Evento</th><th>Data</th><th>Organizador</th><th>Situação</th><th class="num">Vendidos</th><th></th></tr></thead><tbody>
+    ${evs.length ? `<div class="tablewrap"><table><thead><tr><th>Evento</th><th>Data</th><th>Organizador</th><th>Cobrança</th><th>Situação</th><th class="num">Vendidos</th><th></th></tr></thead><tbody>
       ${evs.map(e => { const cap = (e.ticket_types || []).reduce((a, t) => a + t.capacity, 0), sold = (e.ticket_types || []).reduce((a, t) => a + t.sold, 0); return `<tr>
         <td><b>${esc(e.name)}</b></td><td>${esc(fmtShort(e.starts_at))}</td>
         <td><select class="input" style="min-width:180px" data-change="link" data-id="${esc(e.id)}" aria-label="Organizador de ${esc(e.name)}">${orgOptions(e.organizer_id)}</select></td>
+        <td style="white-space:nowrap">${e.platform_fee_type === 'fixed' ? `${money(e.platform_fee_fixed)}/ingr.` : `${num(e.platform_pct)}%`}</td>
         <td>${isPast(e) ? '<span class="chip">Encerrado</span>' : e.published ? '<span class="chip ok">Publicado</span>' : '<span class="chip">Rascunho</span>'}</td>
         <td class="num">${num(sold)}/${num(cap)}</td><td class="num"><a class="btn small" href="#/painel/evento/${esc(e.id)}/info">Gerenciar</a></td></tr>`; }).join('')}
     </tbody></table></div>` : '<p class="note">Nenhum evento ainda.</p>'}
   </div>`, {
+    'change:ptype-fee': chargeToggle,
     'change:link': async el => {
       const { error } = await sb.from('events').update({ organizer_id: el.value || null }).eq('id', el.dataset.id);
       if (error) { toast(errMsg(error), 'bad'); return vAdmin(tab); }
@@ -932,7 +991,7 @@ async function vAdmin(tab) {
     new: async fd => {
       const starts = fromLocalInput(fd.get('starts_at'));
       if (!starts) return toast('Informe a data e a hora.', 'bad');
-      const ev = must(await sb.from('events').insert({ name: String(fd.get('name')).trim(), starts_at: starts, organizer_id: fd.get('organizer_id') || null, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), fee_pct: Number(fd.get('fee_pct')) || 0, platform_pct: Number(fd.get('platform_pct')) || 0 }).select('id').single());
+      const ev = must(await sb.from('events').insert({ name: String(fd.get('name')).trim(), starts_at: starts, organizer_id: fd.get('organizer_id') || null, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), fee_pct: Number(fd.get('fee_pct')) || 0, ...readCharge(fd) }).select('id').single());
       toast('Evento criado. Agora cadastre os lotes.'); go(`#/painel/evento/${ev.id}/lotes`);
     }
   });

@@ -6,8 +6,8 @@ Site de venda de ingressos e gestão de eventos. Ele roda no GitHub Pages, e o l
 
 | Papel | Como vira esse papel | O que pode fazer |
 |---|---|---|
-| **Administração** | Conta marcada como `admin` no banco (passo 4 abaixo) | Cria eventos, cadastra organizadores (PF ou PJ), vincula e desvincula eventos, define a comissão da plataforma e vê tudo. |
-| **Organizador** | A administração cadastra a pessoa pelo e-mail. Quando ela cria a conta no site com esse e-mail e confirma, recebe o acesso. | Gerencia **só os eventos vinculados a ela**: informações, publicação, lotes e preços, financeiro (vendas, comissão, repasse, despesas), pedidos (com exportação CSV) e validação de entrada. Também atualiza o próprio PIX e os dados bancários. |
+| **Administração** | Conta marcada como `admin` no banco (passo 4 abaixo) | Cria eventos e os vincula a organizadores, cadastra organizadores (PF ou PJ), define a cobrança da plataforma (padrão e por evento) e vê tudo. |
+| **Organizador** | A administração cadastra a pessoa pelo e-mail. Quando ela cria a conta no site com esse e-mail e confirma, recebe o acesso. | Cria os próprios eventos e gerencia **só os eventos vinculados a ela**: informações, publicação, lotes e preços, financeiro (vendas, comissão, repasse, despesas), pedidos (com exportação CSV) e validação de entrada. Também atualiza o próprio PIX e os dados bancários. |
 | **Portaria** | O organizador cadastra a pessoa (nome e e-mail) em **Meus eventos → Equipe de portaria** e marca os eventos liberados. Ela cria a conta com esse e-mail. | Só lê o QR Code e valida ingressos dos eventos liberados, sempre do mesmo organizador. Não vê vendas, valores, despesas nem e-mails de compradores, e não altera nada. |
 | **Comprador** | Qualquer pessoa que cria conta | Compra ingressos (inteira e meia-entrada) e vê os próprios códigos em "Meus ingressos". |
 
@@ -71,9 +71,10 @@ O site é estático (HTML, CSS e JavaScript, sem etapa de build). Em **Settings 
 ## Dinheiro: como os valores são calculados
 
 - **Preço da meia-entrada** = metade da inteira; ela usa a mesma lotação do lote.
-- **Taxa de serviço** (% definido por evento) é somada ao total pago pelo comprador e fica com a plataforma.
-- **Comissão da plataforma** (% definido pela administração, o organizador não altera) incide sobre as vendas de ingressos.
-- **Repasse previsto** = vendas − comissão.
+- **Taxa de serviço** (% por evento) é somada ao total pago pelo comprador e fica com a plataforma.
+- **Cobrança da plataforma**, por evento: **percentual** sobre as vendas (padrão) **ou valor fixo em R$ por ingresso vendido** (inteira e meia contam igual).
+- Taxa de serviço e cobrança da plataforma **só a administração altera**. O padrão fica em **Administração → Configurações** e é aplicado aos eventos que os organizadores criam.
+- **Repasse previsto** = vendas − cobrança da plataforma.
 - **Resultado** = repasse − despesas lançadas pelo organizador.
 
 Os preços são recalculados no banco na hora da compra (função `buy_tickets`). O navegador não consegue alterar o valor, e a lotação é travada para dois compradores não levarem a última vaga ao mesmo tempo.
