@@ -40,6 +40,12 @@ function fmtDoc(type, v) {
   return c;
 }
 const instField = (v, idp) => `<div class="field"><label for="${idp}-inst">Parcelamento máximo no cartão</label><select id="${idp}-inst" name="max_installments">${Array.from({ length: 12 }, (_, i) => i + 1).map(n => `<option value="${n}" ${n === (Number(v) || 1) ? 'selected' : ''}>${n === 1 ? 'Só à vista' : `Até ${n}×`}</option>`).join('')}</select><span class="note">O comprador paga a tarifa maior do parcelado. Você recebe sua parte ao longo das parcelas.</span></div>`;
+// Valor de cada parcela como o Asaas calcula: iguais, arredondadas para baixo; os centavos que sobram vão na última
+const parcela = (total, n) => n > 1 ? Math.floor(Math.round(total * 100) / n) / 100 : total;
+const fmtParcelas = (total, n) => {
+  const p = parcela(total, n), last = Math.round((total - p * (n - 1)) * 100) / 100;
+  return Math.abs(last - p) < 0.005 ? `${n}× de ${money(p)}` : `${n - 1}× de ${money(p)} + 1× de ${money(last)}`;
+};
 const readInst = fd => Math.max(1, Math.min(12, Number(fd.get('max_installments')) || 1));
 const orgName = o => o ? (o.trade_name || o.legal_name) : '';
 const fmtCharge = ev => ev.platform_fee_type === 'fixed' ? `${money(ev.platform_fee_fixed)} por ingresso vendido` : `${num(ev.platform_pct)}% sobre as vendas`;
@@ -349,7 +355,7 @@ async function vEvent(id) {
         <div class="note"><span>Taxa de serviço (${num(ev.fee_pct)}%)</span><span>${money(c.fee)}</span></div>
         ${online && c.pfee ? `<div class="note"><span>Taxa do ${method === 'pix' ? 'Pix' : 'cartão'}</span><span>${money(c.pfee)}</span></div>` : ''}
         <div class="total"><span>Total</span><span>${money(c.total)}</span></div>
-        ${online && method === 'card' && inst > 1 ? `<div class="note"><span>Em ${inst}× no cartão</span><span>${inst}× de ${money(c.total / inst)}</span></div>` : ''}</div>`
+        ${online && method === 'card' && inst > 1 ? `<div class="note"><span>Em ${inst}× no cartão</span><span>${fmtParcelas(c.total, inst)}</span></div>` : ''}</div>`
       : '<p class="note">Adicione ingressos para ver o total.</p>';
     if (online) {
       const base = c.subtotal - c.discount + c.fee;
@@ -363,7 +369,7 @@ async function vEvent(id) {
         const sel = document.getElementById('buyer-inst');
         if (sel && c.count) sel.innerHTML = Array.from({ length: maxInst }, (_, i) => i + 1).map(n => {
           const t = base + payFee(base, 'card', cfg, n);
-          return `<option value="${n}" ${n === inst ? 'selected' : ''}>${n === 1 ? `À vista · ${money(t)}` : `${n}× de ${money(t / n)} · total ${money(t)}`}</option>`;
+          return `<option value="${n}" ${n === inst ? 'selected' : ''}>${n === 1 ? `À vista · ${money(t)}` : `${fmtParcelas(t, n)} · total ${money(t)}`}</option>`;
         }).join('');
       }
     }
@@ -519,7 +525,7 @@ async function vPay(id) {
   const summary = `<div class="sum"><div><span>Ingressos</span><span>${money(o.subtotal)}</span></div>${Number(o.discount) ? `<div style="color:var(--ok)"><span>Cupom ${esc(o.coupon_code)}</span><span>−${money(o.discount)}</span></div>` : ''}<div class="note"><span>Taxa de serviço</span><span>${money(o.fee)}</span></div>
     ${Number(o.payment_fee) ? `<div class="note"><span>Taxa do ${card ? 'cartão' : 'Pix'}</span><span>${money(o.payment_fee)}</span></div>` : ''}
     <div class="total"><span>Total</span><span>${money(o.total)}</span></div>
-    ${card && o.installments > 1 ? `<div class="note"><span>Em ${o.installments}× no cartão</span><span>${o.installments}× de ${money(o.total / o.installments)}</span></div>` : ''}</div>`;
+    ${card && o.installments > 1 ? `<div class="note"><span>Em ${o.installments}× no cartão</span><span>${fmtParcelas(Number(o.total), o.installments)}</span></div>` : ''}</div>`;
   const tick = () => {
     const el = document.getElementById('countdown'); if (!el) return;
     const ms = new Date(o.expires_at).getTime() - Date.now();
