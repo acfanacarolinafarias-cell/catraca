@@ -28,5 +28,5 @@ jobs:
             echo "::error::Falta o segredo SUPABASE_ACCESS_TOKEN no GitHub (Settings > Secrets and variables > Actions)."
             exit 1
           fi
-      - name: Publicar checkout e payment-webhook
+      - name: Publicar checkout, payment-webhook e expire-orders
         run: supabase functions deploy --project-ref "$PROJECT_REF" --use-api --yes
