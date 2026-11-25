@@ -20,7 +20,7 @@ export async function handle(req: Request, db = serviceClient()): Promise<Respon
     if (!order_id) throw new HttpError(400, 'Pedido não informado.');
 
     const { data: o, error } = await db.from('orders')
-      .select('id, code, buyer_id, buyer_name, buyer_email, status, expires_at, total, payment_method, organizer_amount, provider, provider_payment_id, provider_data, events(name, organizer_id, organizers(payout_provider, payout_account))')
+      .select('id, code, buyer_id, buyer_name, buyer_email, status, expires_at, total, payment_method, installments, organizer_amount, provider, provider_payment_id, provider_data, events(name, organizer_id, organizers(payout_provider, payout_account))')
       .eq('id', order_id).maybeSingle();
     if (error) throw error;
     if (!o || o.buyer_id !== user.id) throw new HttpError(404, 'Pedido não encontrado.');
@@ -45,12 +45,12 @@ export async function handle(req: Request, db = serviceClient()): Promise<Respon
     }
 
     const result = await provider.createCharge({
-      orderId: o.id, orderCode: o.code, method: o.payment_method as Method, total: Number(o.total),
+      orderId: o.id, orderCode: o.code, method: o.payment_method as Method, installments: Number(o.installments) || 1, total: Number(o.total),
       description: `Ingressos ${(o as any).events?.name ?? ''} · pedido ${o.code}`,
       buyer: { userId: user.id, name: o.buyer_name, email: o.buyer_email || user.email || '', document: doc },
       split,
     });
-    const payment = { method: o.payment_method, pix: result.pix ?? null, checkout_url: result.checkoutUrl ?? null };
+    const payment = { method: o.payment_method, installments: Number(o.installments) || 1, pix: result.pix ?? null, checkout_url: result.checkoutUrl ?? null };
 
     // Grava só se ninguém gravou antes (duas abas abertas ao mesmo tempo)
     const { data: saved } = await db.from('orders')
