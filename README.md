@@ -72,7 +72,7 @@ O site é estático (HTML, CSS e JavaScript, sem etapa de build). Em **Settings 
 
 - O comprador escolhe **Pix** ou **cartão**. A tarifa do meio de pagamento é **somada ao total dele** (valores em Administração → Configurações, com faixas para cartão à vista, 2 a 6 e 7 a 12 parcelas).
 - **Parcelamento no cartão:** cada evento define o máximo de parcelas (1 a 12, em Gerenciar evento → Informações). O comprador vê o valor de cada opção antes de pagar. No Asaas vira um parcelamento, e a parte do organizador é dividida entre as parcelas (`totalFixedValue`).
-- **Dúvidas frequentes** (`#/ajuda`): inclui a regra de cancelamento (a taxa de serviço não é reembolsável), também avisada na tela de compra.
+- **Dúvidas frequentes** (`#/ajuda`): inclui a política de cancelamento (devolução integral em até 7 dias da compra; depois, desconta as taxas; pedidos até 48 horas antes do evento; evento cancelado pela organização: devolução integral), também resumida na tela de compra.
 - As vagas ficam reservadas por alguns minutos (padrão 15) enquanto ele paga. Sem pagamento, voltam para a venda e a cobrança é cancelada no Asaas (função `expire-orders`, a cada 2 minutos), para ninguém pagar depois do prazo.
 - Quando o Asaas avisa que o pagamento caiu, o pedido é confirmado e os ingressos com QR Code aparecem.
 - A parte do organizador (vendas − cobrança da plataforma − taxa de split) vai **direto para a carteira Asaas dele** (split). O restante fica na conta da plataforma.

@@ -403,7 +403,7 @@ async function vEvent(id) {
           <div class="field"><label for="buyer-doc">CPF de quem paga</label><input id="buyer-doc" name="document" inputmode="numeric" autocomplete="off" required placeholder="000.000.000-00" data-input="doc"></div>
           <button class="btn primary" id="buy-btn" type="submit" disabled>Ir para o pagamento</button>
           <p class="note">As vagas ficam reservadas por ${num(cfg.reservation_minutes || 15)} minutos enquanto você paga. Os ingressos com QR Code aparecem assim que o pagamento for aprovado.</p>
-          <p class="note">A taxa de serviço não é reembolsável em caso de cancelamento. <a href="#/ajuda">Veja as dúvidas frequentes</a>.</p>`
+          <p class="note">Cancelamento: devolução integral em até 7 dias da compra; depois, desconta as taxas. Pedidos até 48 horas antes do evento. Evento cancelado pela organização: devolução integral. <a href="#/ajuda">Saiba mais</a>.</p>`
           : `<button class="btn primary" id="buy-btn" type="submit" disabled>Confirmar pedido</button>
           <p class="note">A reserva fica registrada e os códigos de entrada são emitidos na hora. O pagamento é combinado com quem organiza o evento.</p>`}
         </form>`
@@ -448,8 +448,9 @@ const FAQ = [
   ['Como compro um ingresso?', 'Escolha o evento, os lotes e a quantidade, entre na sua conta e pague com Pix ou cartão. As vagas ficam reservadas enquanto você paga.'],
   ['Quais são as formas de pagamento?', 'Pix e cartão de crédito. Alguns eventos aceitam parcelar no cartão; o número máximo de parcelas é definido por quem organiza e aparece na hora de pagar, com o valor de cada parcela.'],
   ['O que é a taxa de serviço?', 'É o valor cobrado pela plataforma pela venda online, mostrado no resumo do pedido antes de pagar. A tarifa do Pix ou do cartão também aparece separada no resumo.'],
-  ['Em caso de cancelamento, recebo o dinheiro de volta?', 'Se o evento for cancelado, você recebe de volta o valor pago, exceto a taxa de serviço, que não é reembolsável. Pedidos de desistência seguem a política informada pela organização na página do evento.'],
-  ['E se o evento for adiado?', 'A organização avisa a nova data. Se você não puder ir, siga a política de cancelamento informada na página do evento.'],
+  ['Posso desistir da compra?', 'Sim, até 48 horas antes do início do evento. Dentro de 7 dias corridos após a compra, a devolução é integral, com todas as taxas, conforme o art. 49 do Código de Defesa do Consumidor. Depois desse prazo, o reembolso desconta a taxa de serviço e a tarifa do Pix ou do cartão. Com menos de 48 horas para o evento, não há cancelamento pelo comprador.'],
+  ['E se o evento for cancelado?', 'Se a organização cancelar o evento, você recebe de volta o valor pago integralmente, incluindo todas as taxas.'],
+  ['E se o evento for adiado?', 'A organização avisa a nova data. Se você não puder ir, pode pedir o cancelamento nas mesmas condições de desistência.'],
   ['Onde ficam meus ingressos?', 'Em “Meus ingressos”, assim que o pagamento é aprovado. Cada ingresso tem um QR Code, que é lido na entrada. Cada código vale uma entrada.'],
   ['Comprei meia-entrada. O que preciso levar?', 'O documento que comprova o direito à meia-entrada (Lei 12.933/2013). Ele é conferido na entrada.'],
   ['O prazo para pagar acabou. E agora?', 'As vagas voltam para a venda e a cobrança é cancelada. Se ainda houver ingressos, faça um novo pedido.'],
