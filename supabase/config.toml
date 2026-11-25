@@ -8,3 +8,7 @@ verify_jwt = false
 
 [functions.payment-webhook]
 verify_jwt = false
+
+# Vence reservas e cancela cobranças abertas; chamada pelo agendamento do banco (supabase/cron.sql).
+[functions.expire-orders]
+verify_jwt = false

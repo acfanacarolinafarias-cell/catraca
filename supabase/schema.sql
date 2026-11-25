@@ -399,6 +399,8 @@ alter table public.orders add column if not exists organizer_amount    numeric(1
 alter table public.orders add column if not exists provider            text;
 alter table public.orders add column if not exists provider_payment_id text;
 alter table public.orders add column if not exists provider_data       jsonb;
+-- Quando a cobrança de um pedido vencido foi cancelada no meio de pagamento (função expire-orders)
+alter table public.orders add column if not exists provider_canceled_at timestamptz;
 alter table public.orders add column if not exists paid_at             timestamptz;
 do $$ begin
   alter table public.orders add constraint orders_status_check

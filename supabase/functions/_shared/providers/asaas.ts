@@ -70,7 +70,15 @@ export const asaas: PaymentProvider = {
   },
 
   async cancelCharge(paymentId: string) {
-    await api(`/payments/${paymentId}`, { method: 'DELETE' }).catch(() => {});
+    try {
+      await api(`/payments/${paymentId}`, { method: 'DELETE' });
+      return true;
+    } catch (e) {
+      // Já removida no Asaas: considera cancelada. Outros erros (ex.: já foi paga) ficam para a próxima rodada.
+      if (e instanceof HttpError && /não encontrad|not found/i.test(e.message)) return true;
+      console.error('cancelCharge', paymentId, e);
+      return false;
+    }
   },
 
   async parseWebhook(req: Request): Promise<WebhookOutcome> {

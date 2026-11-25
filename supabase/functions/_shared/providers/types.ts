@@ -28,7 +28,8 @@ export type WebhookOutcome =
 export interface PaymentProvider {
   name: string;
   createCharge(input: ChargeInput): Promise<ChargeResult>;
-  cancelCharge(paymentId: string): Promise<void>;
+  /** Cancela uma cobrança ainda não paga. Devolve true se cancelou (ou se ela já não existia). */
+  cancelCharge(paymentId: string): Promise<boolean>;
   /** Valida a origem do aviso e o traduz. Lança HttpError(401) se a origem for inválida. */
   parseWebhook(req: Request): Promise<WebhookOutcome>;
 }

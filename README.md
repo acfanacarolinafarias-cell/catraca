@@ -71,7 +71,7 @@ O site é estático (HTML, CSS e JavaScript, sem etapa de build). Em **Settings 
 ## Pagamento online (Asaas, com divisão automática)
 
 - O comprador escolhe **Pix** ou **cartão**. A tarifa do meio de pagamento é **somada ao total dele** (valores em Administração → Configurações).
-- As vagas ficam reservadas por alguns minutos (padrão 15) enquanto ele paga. Sem pagamento, voltam para a venda.
+- As vagas ficam reservadas por alguns minutos (padrão 15) enquanto ele paga. Sem pagamento, voltam para a venda e a cobrança é cancelada no Asaas (função `expire-orders`, a cada 2 minutos), para ninguém pagar depois do prazo.
 - Quando o Asaas avisa que o pagamento caiu, o pedido é confirmado e os ingressos com QR Code aparecem.
 - A parte do organizador (vendas − cobrança da plataforma − taxa de split) vai **direto para a carteira Asaas dele** (split). O restante fica na conta da plataforma.
 - Cada organizador informa o **Wallet ID** do Asaas em "Dados cadastrais e de recebimento". Sem ele, o evento não vende online.
@@ -82,6 +82,8 @@ O site é estático (HTML, CSS e JavaScript, sem etapa de build). Em **Settings 
 ```
 supabase/functions/checkout          cria a cobrança (chamado pelo site)
 supabase/functions/payment-webhook   recebe o aviso de pagamento do Asaas
+supabase/functions/expire-orders     vence reservas e cancela cobranças abertas (agendada)
+supabase/cron.sql                    agendamento da expire-orders (rodar uma vez no SQL Editor)
 supabase/functions/_shared/providers  um arquivo por meio de pagamento (asaas.ts)
 .github/workflows/deploy-functions.yml publica as funções no Supabase a cada mudança
 ```
@@ -95,6 +97,8 @@ supabase/functions/_shared/providers  um arquivo por meio de pagamento (asaas.ts
 | `ASAAS_API_KEY` | chave de API da conta da plataforma no Asaas |
 | `ASAAS_ENV` | `sandbox` para testes, `production` para valer |
 | `ASAAS_WEBHOOK_TOKEN` | código secreto (32+ caracteres) que você também cadastra no webhook do Asaas |
+
+Agendamento: depois de publicar as funções, rode [`supabase/cron.sql`](supabase/cron.sql) uma vez no **SQL Editor**. Ele chama a `expire-orders` a cada 2 minutos.
 
 Webhook no Asaas (Integrações → Webhooks): URL `https://xfrbybveoschauaaxmbk.supabase.co/functions/v1/payment-webhook?provider=asaas`, eventos de **cobrança** (PAYMENT_CONFIRMED, PAYMENT_RECEIVED, PAYMENT_OVERDUE, PAYMENT_DELETED, PAYMENT_REFUNDED).
 
