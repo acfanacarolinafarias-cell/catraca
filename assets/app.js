@@ -39,6 +39,8 @@ function fmtDoc(type, v) {
   if (type === 'PJ' && c.length === 14) return c.replace(/(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})/, '$1.$2.$3/$4-$5');
   return c;
 }
+const instField = (v, idp) => `<div class="field"><label for="${idp}-inst">Parcelamento máximo no cartão</label><select id="${idp}-inst" name="max_installments">${Array.from({ length: 12 }, (_, i) => i + 1).map(n => `<option value="${n}" ${n === (Number(v) || 1) ? 'selected' : ''}>${n === 1 ? 'Só à vista' : `Até ${n}×`}</option>`).join('')}</select><span class="note">O comprador paga a tarifa maior do parcelado. Você recebe sua parte ao longo das parcelas.</span></div>`;
+const readInst = fd => Math.max(1, Math.min(12, Number(fd.get('max_installments')) || 1));
 const orgName = o => o ? (o.trade_name || o.legal_name) : '';
 const fmtCharge = ev => ev.platform_fee_type === 'fixed' ? `${money(ev.platform_fee_fixed)} por ingresso vendido` : `${num(ev.platform_pct)}% sobre as vendas`;
 const getSettings = async () => (await sb.from('settings').select('*').eq('id', 1).maybeSingle()).data
@@ -168,6 +170,7 @@ function renderNav() {
   if (isOrganizer()) links.push(['#/painel', 'Meus eventos']);
   if (isStaff()) links.push(['#/portaria', 'Portaria']);
   if (isAdmin()) links.push(['#/admin', 'Administração']);
+  links.push(['#/ajuda', 'Dúvidas']);
   const active = l => l === '#/' ? (h === '#/' || h === '#' || h.startsWith('#/evento')) : h.startsWith(l);
   $nav.innerHTML = links.map(([l, t]) => `<a class="tab" href="${l}" ${active(l) ? 'aria-current="page"' : ''}>${t}</a>`).join('') +
     (me.user ? `<span class="who" title="${esc(me.user.email)}">${esc(me.profile?.full_name || me.user.email)}</span><button class="tab" id="logout">Sair</button>`
@@ -194,6 +197,7 @@ async function route() {
       case 'entrar': return me.user ? go(homeFor()) : vLogin(b || 'entrar');
       case 'nova-senha': return vNewPassword();
       case 'meus-ingressos': return requireLogin() && await vMyTickets();
+      case 'ajuda': return vHelp();
       case 'painel':
         if (!requireLogin()) return;
         if (b === 'evento') return await vManage(c, d || 'info');
@@ -231,7 +235,7 @@ function vSetup() {
 }
 
 /* ================= vitrine ================= */
-const EV_PUBLIC = 'id,name,starts_at,venue,city,description,fee_pct,published,ticket_types(id,name,price,capacity,allows_half,sort,sold)';
+const EV_PUBLIC = 'id,name,starts_at,venue,city,description,fee_pct,max_installments,published,ticket_types(id,name,price,capacity,allows_half,sort,sold)';
 
 function evStats(ev) {
   const ts = ev.ticket_types || [];
@@ -281,10 +285,11 @@ async function vHome() {
 
 /* ================= evento + compra ================= */
 // Taxa do meio de pagamento repassada ao comprador (mesma conta do banco: payment_fee_for)
-function payFee(base, method, cfg) {
+function payFee(base, method, cfg, inst = 1) {
   if (!(base > 0) || !cfg?.payments_enabled) return 0;
   const f = Number(method === 'pix' ? cfg.pix_fee_fixed : cfg.card_fee_fixed) || 0;
-  const p = Number(method === 'pix' ? cfg.pix_fee_pct : cfg.card_fee_pct) || 0;
+  const p = Number(method === 'pix' ? cfg.pix_fee_pct
+    : inst >= 7 ? cfg.card_fee_pct_7_12 : inst >= 2 ? cfg.card_fee_pct_2_6 : cfg.card_fee_pct) || 0;
   return Math.ceil(((base + f) / (1 - p / 100) - base) * 100 - 1e-6) / 100;
 }
 
@@ -299,6 +304,8 @@ async function vEvent(id) {
   const types = sortTypes(ev.ticket_types);
   const cart = {};
   let method = 'pix';
+  let inst = 1;
+  const maxInst = Math.max(1, Math.min(12, Number(ev.max_installments) || 1));
   let coupon = null;
   const past = isPast(ev);
   // Desconto de um ingresso (mesma regra do banco: coupon_ticket_discount)
@@ -318,7 +325,7 @@ async function vEvent(id) {
     const subtotal = out.reduce((a, l) => a + l.unit * l.qty, 0);
     const discount = Math.round(out.reduce((a, l) => a + l.disc * l.qty, 0) * 100) / 100;
     const fee = Math.round(subtotal * Number(ev.fee_pct)) / 100;   // taxa de serviço sobre o preço cheio
-    const pfee = payFee(subtotal - discount + fee, method, cfg);
+    const pfee = payFee(subtotal - discount + fee, method, cfg, method === 'card' ? inst : 1);
     return { out, subtotal, discount, fee, pfee, total: subtotal - discount + fee + pfee, count: out.reduce((a, l) => a + l.qty, 0) };
   };
 
@@ -341,13 +348,24 @@ async function vEvent(id) {
         ${coupon ? `<div style="color:var(--ok)"><span>Cupom ${esc(coupon.code)}</span><span>${c.discount ? '−' + money(c.discount) : 'não vale para estes ingressos'}</span></div>` : ''}
         <div class="note"><span>Taxa de serviço (${num(ev.fee_pct)}%)</span><span>${money(c.fee)}</span></div>
         ${online && c.pfee ? `<div class="note"><span>Taxa do ${method === 'pix' ? 'Pix' : 'cartão'}</span><span>${money(c.pfee)}</span></div>` : ''}
-        <div class="total"><span>Total</span><span>${money(c.total)}</span></div></div>`
+        <div class="total"><span>Total</span><span>${money(c.total)}</span></div>
+        ${online && method === 'card' && inst > 1 ? `<div class="note"><span>Em ${inst}× no cartão</span><span>${inst}× de ${money(c.total / inst)}</span></div>` : ''}</div>`
       : '<p class="note">Adicione ingressos para ver o total.</p>';
     if (online) {
       const base = c.subtotal - c.discount + c.fee;
       document.querySelectorAll('[data-method-total]').forEach(el => {
-        el.textContent = c.count ? money(base + payFee(base, el.dataset.methodTotal, cfg)) : '';
+        el.textContent = c.count ? money(base + payFee(base, el.dataset.methodTotal, cfg)) + (el.dataset.methodTotal === 'card' && maxInst > 1 ? ` · até ${maxInst}×` : '') : '';
       });
+      // Parcelas: valor de cada opção, com a tarifa da faixa
+      const box = document.getElementById('inst-box');
+      if (box) {
+        box.hidden = !(method === 'card' && maxInst > 1);
+        const sel = document.getElementById('buyer-inst');
+        if (sel && c.count) sel.innerHTML = Array.from({ length: maxInst }, (_, i) => i + 1).map(n => {
+          const t = base + payFee(base, 'card', cfg, n);
+          return `<option value="${n}" ${n === inst ? 'selected' : ''}>${n === 1 ? `À vista · ${money(t)}` : `${n}× de ${money(t / n)} · total ${money(t)}`}</option>`;
+        }).join('');
+      }
     }
     const btn = document.getElementById('buy-btn');
     if (btn) { btn.disabled = !c.count; btn.textContent = !c.count ? (online ? 'Ir para o pagamento' : 'Confirmar pedido') : online ? `Pagar ${money(c.total)}` : `Confirmar ${c.count} ingresso${c.count > 1 ? 's' : ''}`; }
@@ -381,9 +399,11 @@ async function vEvent(id) {
               <label><input type="radio" name="method" value="pix" data-change="method" checked><span><b>Pix</b><small data-method-total="pix"></small></span></label>
               <label><input type="radio" name="method" value="card" data-change="method"><span><b>Cartão de crédito</b><small data-method-total="card"></small></span></label>
             </div></div>
+          ${maxInst > 1 ? `<div class="field" id="inst-box" hidden><label for="buyer-inst">Parcelas no cartão</label><select id="buyer-inst" name="installments" data-change="inst"><option value="1">À vista</option></select></div>` : ''}
           <div class="field"><label for="buyer-doc">CPF de quem paga</label><input id="buyer-doc" name="document" inputmode="numeric" autocomplete="off" required placeholder="000.000.000-00" data-input="doc"></div>
           <button class="btn primary" id="buy-btn" type="submit" disabled>Ir para o pagamento</button>
-          <p class="note">As vagas ficam reservadas por ${num(cfg.reservation_minutes || 15)} minutos enquanto você paga. Os ingressos com QR Code aparecem assim que o pagamento for aprovado.</p>`
+          <p class="note">As vagas ficam reservadas por ${num(cfg.reservation_minutes || 15)} minutos enquanto você paga. Os ingressos com QR Code aparecem assim que o pagamento for aprovado.</p>
+          <p class="note">A taxa de serviço não é reembolsável em caso de cancelamento. <a href="#/ajuda">Veja as dúvidas frequentes</a>.</p>`
           : `<button class="btn primary" id="buy-btn" type="submit" disabled>Confirmar pedido</button>
           <p class="note">A reserva fica registrada e os códigos de entrada são emitidos na hora. O pagamento é combinado com quem organiza o evento.</p>`}
         </form>`
@@ -393,7 +413,8 @@ async function vEvent(id) {
     inc: b => { cart[b.dataset.k] = (cart[b.dataset.k] || 0) + 1; drawLots(); drawSummary(); },
     dec: b => { cart[b.dataset.k] = Math.max(0, (cart[b.dataset.k] || 0) - 1); drawLots(); drawSummary(); },
     login: () => requireLogin(),
-    'change:method': el => { method = el.value; drawSummary(); },
+    'change:method': el => { method = el.value; if (method !== 'card') inst = 1; drawSummary(); },
+    'change:inst': el => { inst = Math.max(1, Math.min(maxInst, Number(el.value) || 1)); drawSummary(); },
     coupon: async () => {
       const box = document.getElementById('coupon-box');
       if (coupon) { coupon = null; box.innerHTML = '<input id="coupon-code" class="input" autocomplete="off" autocapitalize="characters" placeholder="Se tiver, digite aqui" style="flex:1;min-width:0"><button class="btn" type="button" data-act="coupon">Aplicar</button>'; return drawSummary(); }
@@ -413,13 +434,30 @@ async function vEvent(id) {
       const doc = digits(fd.get('document'));
       if (online && !(doc.length === 11 ? validCPF(doc) : doc.length === 14 ? validCNPJ(doc) : false)) return toast('CPF inválido. Confira os números.', 'bad');
       const items = c.out.map(l => ({ type_id: l.t.id, kind: l.kind, qty: l.qty }));
-      const { data, error } = await sb.rpc('buy_tickets', { p_event: ev.id, p_items: items, p_buyer_name: String(fd.get('name') || '').trim(), p_buyer_email: String(fd.get('email') || '').trim(), p_method: online ? method : null, p_coupon: coupon ? coupon.code : null });
+      const { data, error } = await sb.rpc('buy_tickets', { p_event: ev.id, p_items: items, p_buyer_name: String(fd.get('name') || '').trim(), p_buyer_email: String(fd.get('email') || '').trim(), p_method: online ? method : null, p_coupon: coupon ? coupon.code : null, p_installments: online && method === 'card' ? inst : 1 });
       if (error) { toast(errMsg(error), 'bad'); return vEvent(id); }
       if (online) { try { sessionStorage.setItem('doc:' + data, doc); } catch (_) {} }
       go((online ? '#/pagamento/' : '#/pedido/') + data);
     }
   });
   drawLots(); drawSummary();
+}
+
+/* ================= dúvidas frequentes ================= */
+const FAQ = [
+  ['Como compro um ingresso?', 'Escolha o evento, os lotes e a quantidade, entre na sua conta e pague com Pix ou cartão. As vagas ficam reservadas enquanto você paga.'],
+  ['Quais são as formas de pagamento?', 'Pix e cartão de crédito. Alguns eventos aceitam parcelar no cartão; o número máximo de parcelas é definido por quem organiza e aparece na hora de pagar, com o valor de cada parcela.'],
+  ['O que é a taxa de serviço?', 'É o valor cobrado pela plataforma pela venda online, mostrado no resumo do pedido antes de pagar. A tarifa do Pix ou do cartão também aparece separada no resumo.'],
+  ['Em caso de cancelamento, recebo o dinheiro de volta?', 'Se o evento for cancelado, você recebe de volta o valor pago, exceto a taxa de serviço, que não é reembolsável. Pedidos de desistência seguem a política informada pela organização na página do evento.'],
+  ['E se o evento for adiado?', 'A organização avisa a nova data. Se você não puder ir, siga a política de cancelamento informada na página do evento.'],
+  ['Onde ficam meus ingressos?', 'Em “Meus ingressos”, assim que o pagamento é aprovado. Cada ingresso tem um QR Code, que é lido na entrada. Cada código vale uma entrada.'],
+  ['Comprei meia-entrada. O que preciso levar?', 'O documento que comprova o direito à meia-entrada (Lei 12.933/2013). Ele é conferido na entrada.'],
+  ['O prazo para pagar acabou. E agora?', 'As vagas voltam para a venda e a cobrança é cancelada. Se ainda houver ingressos, faça um novo pedido.'],
+];
+function vHelp() {
+  mount(`<div class="page-head"><div><div class="eyebrow">Ajuda</div><h1>Dúvidas frequentes</h1>
+      <p>Compras, pagamentos, cancelamentos e ingressos.</p></div></div>
+    <div class="panel medium" style="width:100%">${FAQ.map(([q, a]) => `<details><summary><b>${esc(q)}</b></summary><p>${esc(a)}</p></details>`).join('')}</div>`);
 }
 
 function passList(tickets) {
@@ -463,7 +501,7 @@ async function invokeFn(name, body) {
 
 async function vPay(id) {
   loading();
-  const FIELDS = 'id,code,status,expires_at,payment_method,subtotal,discount,coupon_code,fee,payment_fee,total,provider_data,events(id,name,starts_at)';
+  const FIELDS = 'id,code,status,expires_at,payment_method,installments,subtotal,discount,coupon_code,fee,payment_fee,total,provider_data,events(id,name,starts_at)';
   let o = must(await sb.from('orders').select(FIELDS).eq('id', id).maybeSingle());
   if (!o) return vMessage('Pedido não encontrado', 'Confira em “Meus ingressos”.');
   if (o.status === 'confirmed') return go('#/pedido/' + id);
@@ -479,7 +517,8 @@ async function vPay(id) {
   const card = o.payment_method === 'card';
   const summary = `<div class="sum"><div><span>Ingressos</span><span>${money(o.subtotal)}</span></div>${Number(o.discount) ? `<div style="color:var(--ok)"><span>Cupom ${esc(o.coupon_code)}</span><span>−${money(o.discount)}</span></div>` : ''}<div class="note"><span>Taxa de serviço</span><span>${money(o.fee)}</span></div>
     ${Number(o.payment_fee) ? `<div class="note"><span>Taxa do ${card ? 'cartão' : 'Pix'}</span><span>${money(o.payment_fee)}</span></div>` : ''}
-    <div class="total"><span>Total</span><span>${money(o.total)}</span></div></div>`;
+    <div class="total"><span>Total</span><span>${money(o.total)}</span></div>
+    ${card && o.installments > 1 ? `<div class="note"><span>Em ${o.installments}× no cartão</span><span>${o.installments}× de ${money(o.total / o.installments)}</span></div>` : ''}</div>`;
   const tick = () => {
     const el = document.getElementById('countdown'); if (!el) return;
     const ms = new Date(o.expires_at).getTime() - Date.now();
@@ -637,6 +676,7 @@ async function vPanel() {
         ${me.organizers.length > 1 ? `<div class="field"><label for="pn-org">Organizador</label><select id="pn-org" name="organizer_id">${me.organizers.map(o => `<option value="${esc(o.id)}">${esc(orgName(o))}</option>`).join('')}</select></div>` : `<input type="hidden" name="organizer_id" value="${esc(ids[0])}">`}
         <div class="field"><label for="pn-venue">Local</label><input id="pn-venue" name="venue"></div>
         <div class="field"><label for="pn-city">Cidade / UF</label><input id="pn-city" name="city"></div>
+        ${instField(1, 'pn')}
         <p class="note full">Cobranças definidas pela plataforma: taxa de serviço de ${num(cfg.default_fee_pct)}% paga pelo comprador e ${esc(charge)}.</p>
         <div class="full row"><button class="btn primary" type="submit">Criar e configurar lotes</button><span class="note">O evento nasce como rascunho. Publique depois de cadastrar os lotes.</span></div>
       </form>
@@ -646,7 +686,7 @@ async function vPanel() {
     new: async fd => {
       const starts = fromLocalInput(fd.get('starts_at'));
       if (!starts) return toast('Informe a data e a hora.', 'bad');
-      const ev = must(await sb.from('events').insert({ name: String(fd.get('name')).trim(), starts_at: starts, organizer_id: fd.get('organizer_id'), venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim() }).select('id').single());
+      const ev = must(await sb.from('events').insert({ name: String(fd.get('name')).trim(), starts_at: starts, organizer_id: fd.get('organizer_id'), venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), max_installments: readInst(fd) }).select('id').single());
       toast('Evento criado. Agora cadastre os lotes.'); go(`#/painel/evento/${ev.id}/lotes`);
     }
   });
@@ -724,6 +764,7 @@ async function mInfo(ev, header, reload, admin) {
       ${admin ? `<div class="field"><label for="e-fee">Taxa de serviço cobrada do comprador (%)</label><input id="e-fee" name="fee_pct" type="number" min="0" max="30" step="0.5" value="${esc(ev.fee_pct)}"></div>` : ''}
       <div class="field"><label for="e-venue">Local</label><input id="e-venue" name="venue" value="${esc(ev.venue)}"></div>
       <div class="field"><label for="e-city">Cidade / UF</label><input id="e-city" name="city" value="${esc(ev.city)}"></div>
+      ${instField(ev.max_installments, 'e')}
       <div class="field full"><label for="e-desc">Descrição</label><textarea id="e-desc" name="description" rows="5">${esc(ev.description)}</textarea></div>
       ${admin ? `
       <div class="field"><label for="e-org">Organizador responsável</label><select id="e-org" name="organizer_id"><option value="">Sem organizador</option>${orgs.map(o => `<option value="${esc(o.id)}" ${o.id === ev.organizer_id ? 'selected' : ''}>${esc(orgName(o))} (${o.person_type})</option>`).join('')}</select></div>
@@ -745,7 +786,7 @@ async function mInfo(ev, header, reload, admin) {
     info: async fd => {
       const starts = fromLocalInput(fd.get('starts_at'));
       if (!starts) return toast('Informe a data e a hora.', 'bad');
-      const body = { name: String(fd.get('name')).trim(), starts_at: starts, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), description: String(fd.get('description')).trim(), published: fd.get('published') === 'on' };
+      const body = { name: String(fd.get('name')).trim(), starts_at: starts, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), description: String(fd.get('description')).trim(), published: fd.get('published') === 'on', max_installments: readInst(fd) };
       if (admin) Object.assign(body, { organizer_id: fd.get('organizer_id') || null, fee_pct: Number(fd.get('fee_pct')) || 0 }, readCharge(fd));
       if (body.published && !(ev.ticket_types || []).length) toast('Lembre de cadastrar os lotes na aba “Lotes”.');
       must(await sb.from('events').update(body).eq('id', ev.id));
@@ -1168,7 +1209,9 @@ async function vAdmin(tab) {
         <div class="field"><label for="c-pixf">Pix: tarifa fixa (R$)</label><input id="c-pixf" name="pix_fee_fixed" type="number" min="0" step="0.01" value="${esc(cfg.pix_fee_fixed ?? 0)}"></div>
         <div class="field"><label for="c-pixp">Pix: tarifa percentual (%)</label><input id="c-pixp" name="pix_fee_pct" type="number" min="0" max="50" step="0.01" value="${esc(cfg.pix_fee_pct ?? 0)}"></div>
         <div class="field"><label for="c-cardf">Cartão: tarifa fixa (R$)</label><input id="c-cardf" name="card_fee_fixed" type="number" min="0" step="0.01" value="${esc(cfg.card_fee_fixed ?? 0)}"></div>
-        <div class="field"><label for="c-cardp">Cartão: tarifa percentual (%)</label><input id="c-cardp" name="card_fee_pct" type="number" min="0" max="50" step="0.01" value="${esc(cfg.card_fee_pct ?? 0)}"></div>
+        <div class="field"><label for="c-cardp">Cartão à vista: tarifa percentual (%)</label><input id="c-cardp" name="card_fee_pct" type="number" min="0" max="50" step="0.01" value="${esc(cfg.card_fee_pct ?? 0)}"></div>
+        <div class="field"><label for="c-card26">Cartão de 2 a 6 parcelas: tarifa percentual (%)</label><input id="c-card26" name="card_fee_pct_2_6" type="number" min="0" max="50" step="0.01" value="${esc(cfg.card_fee_pct_2_6 ?? 0)}"></div>
+        <div class="field"><label for="c-card712">Cartão de 7 a 12 parcelas: tarifa percentual (%)</label><input id="c-card712" name="card_fee_pct_7_12" type="number" min="0" max="50" step="0.01" value="${esc(cfg.card_fee_pct_7_12 ?? 0)}"></div>
         <div class="field"><label for="c-split">Taxa de split por pedido (R$, paga pelo organizador)</label><input id="c-split" name="split_fee_fixed" type="number" min="0" step="0.01" value="${esc(cfg.split_fee_fixed ?? 0)}"></div>
         <div class="field"><label for="c-res">Tempo para pagar (minutos)</label><input id="c-res" name="reservation_minutes" type="number" min="5" max="120" step="1" value="${esc(cfg.reservation_minutes ?? 15)}"></div>
       </div>
@@ -1178,7 +1221,7 @@ async function vAdmin(tab) {
         const c = readCharge(fd);
         const n = k => Number(fd.get(k)) || 0;
         must(await sb.from('settings').update({ default_fee_pct: n('default_fee_pct'), default_platform_type: c.platform_fee_type, default_platform_pct: c.platform_pct, default_platform_fixed: c.platform_fee_fixed,
-          payments_enabled: fd.get('payments_enabled') === 'on', pix_fee_fixed: n('pix_fee_fixed'), pix_fee_pct: n('pix_fee_pct'), card_fee_fixed: n('card_fee_fixed'), card_fee_pct: n('card_fee_pct'),
+          payments_enabled: fd.get('payments_enabled') === 'on', pix_fee_fixed: n('pix_fee_fixed'), pix_fee_pct: n('pix_fee_pct'), card_fee_fixed: n('card_fee_fixed'), card_fee_pct: n('card_fee_pct'), card_fee_pct_2_6: n('card_fee_pct_2_6'), card_fee_pct_7_12: n('card_fee_pct_7_12'),
           split_fee_fixed: n('split_fee_fixed'), reservation_minutes: Math.min(120, Math.max(5, Math.round(n('reservation_minutes')) || 15)), updated_at: new Date().toISOString() }).eq('id', 1));
         toast('Configurações salvas.');
       }
@@ -1219,6 +1262,7 @@ async function vAdmin(tab) {
       <div class="field"><label for="n-org">Vincular ao organizador</label><select id="n-org" name="organizer_id">${orgOptions('')}</select></div>
       <div class="field"><label for="n-venue">Local</label><input id="n-venue" name="venue"></div>
       <div class="field"><label for="n-city">Cidade / UF</label><input id="n-city" name="city"></div>
+      ${instField(1, 'n')}
       <div class="field"><label for="n-fee">Taxa de serviço paga pelo comprador (%)</label><input id="n-fee" name="fee_pct" type="number" min="0" max="30" step="0.5" value="${esc(cfg.default_fee_pct)}"></div>
       ${chargeFields({ type: cfg.default_platform_type, pct: cfg.default_platform_pct, fixed: cfg.default_platform_fixed }, 'n')}
       <div class="full row"><button class="btn primary" type="submit">Criar e configurar lotes</button><span class="note">O evento nasce como rascunho. Publique depois de cadastrar os lotes.</span></div>
@@ -1245,7 +1289,7 @@ async function vAdmin(tab) {
     new: async fd => {
       const starts = fromLocalInput(fd.get('starts_at'));
       if (!starts) return toast('Informe a data e a hora.', 'bad');
-      const ev = must(await sb.from('events').insert({ name: String(fd.get('name')).trim(), starts_at: starts, organizer_id: fd.get('organizer_id') || null, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), fee_pct: Number(fd.get('fee_pct')) || 0, ...readCharge(fd) }).select('id').single());
+      const ev = must(await sb.from('events').insert({ name: String(fd.get('name')).trim(), starts_at: starts, organizer_id: fd.get('organizer_id') || null, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), fee_pct: Number(fd.get('fee_pct')) || 0, max_installments: readInst(fd), ...readCharge(fd) }).select('id').single());
       toast('Evento criado. Agora cadastre os lotes.'); go(`#/painel/evento/${ev.id}/lotes`);
     }
   });

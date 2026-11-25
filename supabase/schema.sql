@@ -378,6 +378,19 @@ alter table public.settings add column if not exists pix_fee_pct         numeric
 alter table public.settings add column if not exists card_fee_fixed      numeric(10,2) not null default 0.49;
 alter table public.settings add column if not exists card_fee_pct        numeric(5,2) not null default 2.99;
 alter table public.settings add column if not exists split_fee_fixed     numeric(10,2) not null default 0;
+-- Cartão parcelado: tarifa percentual do Asaas por faixa de parcelas (a fixa é a mesma do à vista)
+alter table public.settings add column if not exists card_fee_pct_2_6    numeric(5,2) not null default 3.49;
+alter table public.settings add column if not exists card_fee_pct_7_12   numeric(5,2) not null default 3.99;
+do $$ begin
+  alter table public.settings add constraint settings_installment_fees_check check (
+    card_fee_pct_2_6 between 0 and 50 and card_fee_pct_7_12 between 0 and 50);
+exception when duplicate_object then null; end $$;
+
+-- Parcelamento máximo no cartão, definido pelo organizador em cada evento (1 = só à vista)
+alter table public.events add column if not exists max_installments integer not null default 1;
+do $$ begin
+  alter table public.events add constraint events_max_installments_check check (max_installments between 1 and 12);
+exception when duplicate_object then null; end $$;
 do $$ begin
   alter table public.settings add constraint settings_payment_values_check check (
     reservation_minutes between 5 and 120 and pix_fee_fixed >= 0 and card_fee_fixed >= 0
@@ -402,6 +415,7 @@ alter table public.orders add column if not exists provider_data       jsonb;
 -- Quando a cobrança de um pedido vencido foi cancelada no meio de pagamento (função expire-orders)
 alter table public.orders add column if not exists provider_canceled_at timestamptz;
 alter table public.orders add column if not exists paid_at             timestamptz;
+alter table public.orders add column if not exists installments        integer not null default 1;
 do $$ begin
   alter table public.orders add constraint orders_status_check
     check (status in ('pending', 'confirmed', 'expired', 'canceled', 'refunded', 'refund_needed'));
@@ -441,7 +455,8 @@ alter table public.tickets add column if not exists discount    numeric(10,2) no
 
 -- Taxa do meio de pagamento repassada ao comprador: o total é calculado para que,
 -- depois da tarifa (fixo + %), sobre exatamente o valor base.
-create or replace function public.payment_fee_for(p_base numeric, p_method text) returns numeric
+drop function if exists public.payment_fee_for(numeric, text);
+create or replace function public.payment_fee_for(p_base numeric, p_method text, p_installments integer default 1) returns numeric
 language plpgsql stable security definer set search_path = public as $$
 declare
   cfg public.settings%rowtype;
@@ -450,7 +465,10 @@ begin
   if p_base <= 0 or p_method not in ('pix', 'card') then return 0; end if;
   select * into cfg from public.settings where id = 1;
   f := case p_method when 'pix' then cfg.pix_fee_fixed else cfg.card_fee_fixed end;
-  p := case p_method when 'pix' then cfg.pix_fee_pct else cfg.card_fee_pct end;
+  p := case when p_method = 'pix' then cfg.pix_fee_pct
+            when coalesce(p_installments, 1) >= 7 then cfg.card_fee_pct_7_12
+            when coalesce(p_installments, 1) >= 2 then cfg.card_fee_pct_2_6
+            else cfg.card_fee_pct end;
   return ceil(((p_base + f) / (1 - p / 100) - p_base) * 100) / 100;
 end $$;
 
@@ -515,9 +533,10 @@ $$;
 
 drop function if exists public.buy_tickets(uuid, jsonb, text, text);
 drop function if exists public.buy_tickets(uuid, jsonb, text, text, text);
+drop function if exists public.buy_tickets(uuid, jsonb, text, text, text, text);
 create or replace function public.buy_tickets(
   p_event uuid, p_items jsonb, p_buyer_name text, p_buyer_email text default '',
-  p_method text default null, p_coupon text default null
+  p_method text default null, p_coupon text default null, p_installments integer default 1
 ) returns uuid
 language plpgsql security definer set search_path = public as $$
 declare
@@ -543,6 +562,7 @@ declare
   v_n        integer := 0;
   v_used     integer;
   v_online   boolean;
+  v_inst     integer := 1;
 begin
   if v_uid is null then
     raise exception 'Entre na sua conta para comprar.';
@@ -567,6 +587,12 @@ begin
   if v_online then
     if coalesce(p_method, '') not in ('pix', 'card') then
       raise exception 'Escolha a forma de pagamento: Pix ou cartão.';
+    end if;
+    if p_method = 'card' then
+      v_inst := coalesce(p_installments, 1);
+      if v_inst < 1 or v_inst > v_event.max_installments then
+        raise exception 'Este evento aceita no máximo % parcela(s) no cartão.', v_event.max_installments;
+      end if;
     end if;
     if v_event.organizer_id is not null then
       select coalesce(payout_account, '') into v_wallet from public.organizers where id = v_event.organizer_id;
@@ -667,11 +693,11 @@ begin
   v_charge := v_subtotal - v_discount + v_fee;   -- valor antes da taxa do meio de pagamento
 
   if v_online and v_charge > 0 then
-    v_payfee := public.payment_fee_for(v_charge, p_method);
+    v_payfee := public.payment_fee_for(v_charge, p_method, v_inst);
     update public.orders set
       subtotal = v_subtotal, discount = v_discount, fee = v_fee, payment_fee = v_payfee, total = v_charge + v_payfee,
       commission = v_comm, split_fee = v_split, organizer_amount = v_orgamt,
-      payment_method = p_method, status = 'pending',
+      payment_method = p_method, installments = v_inst, status = 'pending',
       expires_at = now() + make_interval(mins => coalesce(cfg.reservation_minutes, 15))
     where id = v_order;
   else
@@ -928,7 +954,7 @@ grant insert, update, delete on public.events to authenticated;
 grant select on public.settings to anon, authenticated;
 grant update (default_fee_pct, default_platform_type, default_platform_pct, default_platform_fixed, updated_at,
               payments_enabled, reservation_minutes, pix_fee_fixed, pix_fee_pct, card_fee_fixed, card_fee_pct,
-              split_fee_fixed)
+              split_fee_fixed, card_fee_pct_2_6, card_fee_pct_7_12)
   on public.settings to authenticated;
 grant insert (id, event_id, name, price, capacity, allows_half, sort),
       update (name, price, capacity, allows_half, sort),
@@ -939,8 +965,8 @@ grant select, insert (id, organizer_id, name, email), update (name, email), dele
 grant select, insert, delete on public.staff_events to authenticated;
 grant select, insert, update, delete on public.coupons to authenticated;
 
-revoke execute on function public.buy_tickets(uuid, jsonb, text, text, text, text) from public, anon;
-grant execute on function public.buy_tickets(uuid, jsonb, text, text, text, text) to authenticated;
+revoke execute on function public.buy_tickets(uuid, jsonb, text, text, text, text, integer) from public, anon;
+grant execute on function public.buy_tickets(uuid, jsonb, text, text, text, text, integer) to authenticated;
 revoke execute on function public.check_coupon(uuid, text) from public, anon;
 grant execute on function public.check_coupon(uuid, text) to authenticated;
 revoke execute on function public.release_expired(uuid) from public, anon;
@@ -951,7 +977,7 @@ grant execute on function public.mark_refunded(uuid) to authenticated;
 revoke execute on function public.confirm_payment(text, text) from public, anon, authenticated;
 revoke execute on function public.fail_payment(text, text, text) from public, anon, authenticated;
 revoke execute on function public.release_order_seats(uuid) from public, anon, authenticated;
-revoke execute on function public.payment_fee_for(numeric, text) from public, anon, authenticated;
+revoke execute on function public.payment_fee_for(numeric, text, integer) from public, anon, authenticated;
 grant execute on function public.confirm_payment(text, text) to service_role;
 grant execute on function public.fail_payment(text, text, text) to service_role;
 -- O que as Edge Functions (checkout e payment-webhook) leem e gravam com a chave de servidor.

@@ -8,6 +8,7 @@ export interface ChargeInput {
   orderId: string;
   orderCode: string;
   method: Method;
+  installments: number;     // parcelas no cartão (1 = à vista)
   total: number;            // valor total pago pelo comprador (R$)
   description: string;
   buyer: { userId: string; name: string; email: string; document: string };

@@ -47,21 +47,29 @@ export const asaas: PaymentProvider = {
 
   async createCharge(input: ChargeInput): Promise<ChargeResult> {
     const customer = await findOrCreateCustomer(input.buyer);
+    const total = Number(input.total.toFixed(2));
+    // Cartão parcelado: o Asaas cria um parcelamento; o split usa totalFixedValue,
+    // que divide a parte do organizador entre as parcelas.
+    const parcelado = input.method === 'card' && input.installments > 1;
     const payment = await api('/payments', {
       method: 'POST',
       body: JSON.stringify({
         customer,
         billingType: input.method === 'pix' ? 'PIX' : 'CREDIT_CARD',
-        value: Number(input.total.toFixed(2)),
+        ...(parcelado ? { installmentCount: input.installments, totalValue: total } : { value: total }),
         dueDate: todayBR(),
         description: input.description.slice(0, 500),
         externalReference: input.orderId,
         split: input.split.length
-          ? input.split.map(s => ({ walletId: s.account, fixedValue: Number(s.amount.toFixed(2)) }))
+          ? input.split.map(s => parcelado
+              ? { walletId: s.account, totalFixedValue: Number(s.amount.toFixed(2)) }
+              : { walletId: s.account, fixedValue: Number(s.amount.toFixed(2)) })
           : undefined,
       }),
     });
-    const out: ChargeResult = { paymentId: payment.id, checkoutUrl: payment.invoiceUrl };
+    // Parcelado: o pedido fica ligado ao parcelamento (os avisos de cada parcela trazem o mesmo id)
+    const id = parcelado && payment.installment ? String(payment.installment) : payment.id;
+    const out: ChargeResult = { paymentId: id, checkoutUrl: payment.invoiceUrl };
     if (input.method === 'pix') {
       const qr = await api(`/payments/${payment.id}/pixQrCode`);
       out.pix = { qrImage: qr.encodedImage, payload: qr.payload, expiresAt: qr.expirationDate };
@@ -71,7 +79,8 @@ export const asaas: PaymentProvider = {
 
   async cancelCharge(paymentId: string) {
     try {
-      await api(`/payments/${paymentId}`, { method: 'DELETE' });
+      // Ids de cobrança começam com "pay_"; os demais são de parcelamento
+      await api(paymentId.startsWith('pay_') ? `/payments/${paymentId}` : `/installments/${paymentId}`, { method: 'DELETE' });
       return true;
     } catch (e) {
       // Já removida no Asaas: considera cancelada. Outros erros (ex.: já foi paga) ficam para a próxima rodada.
@@ -87,7 +96,8 @@ export const asaas: PaymentProvider = {
       throw new HttpError(401, 'Aviso de pagamento com código inválido.');
     }
     const body = await req.json().catch(() => null);
-    const id = body?.payment?.id as string | undefined;
+    // Parcela de um parcelamento: o pedido está ligado ao id do parcelamento
+    const id = (body?.payment?.installment || body?.payment?.id) as string | undefined;
     if (!id) return { kind: 'ignore' };
     switch (body.event) {
       case 'PAYMENT_CONFIRMED':
