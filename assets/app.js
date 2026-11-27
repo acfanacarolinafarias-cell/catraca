@@ -264,7 +264,7 @@ function evStats(ev) {
   const open = ts.filter(t => lotState(t) === 'on');
   const prices = (open.length ? open : ts).map(t => t.allows_half ? half(t.price) : Number(t.price));
   const soldOut = ts.length > 0 && ts.every(t => lotState(t) === 'soldout');
-  return { known, cap, sold, left: Math.max(0, cap - sold), pct: cap ? Math.min(100, Math.round(sold / cap * 100)) : 0, min: prices.length ? Math.min(...prices) : 0, soldOut };
+  return { known, cap, sold, left: Math.max(0, cap - sold), pct: cap ? Math.min(100, Math.round(sold / cap * 100)) : 0, min: prices.length ? Math.min(...prices) : 0, free: ts.length > 0 && ts.every(t => Number(t.price) === 0), soldOut };
 }
 
 function ticketCard(ev, href) {
@@ -287,7 +287,7 @@ function ticketCard(ev, href) {
       <h3>${esc(ev.name)}</h3>
       <div class="meta">${esc(ev.venue)}${ev.city ? ' · ' + esc(ev.city) : ''}</div>
       <div class="tfoot">
-        <div class="from">a partir de<strong>${money(s.min)}</strong></div>
+        <div class="from">${s.free ? '<strong>Grátis</strong>' : `a partir de<strong>${money(s.min)}</strong>`}</div>
         ${s.known ? `<div style="display:grid;gap:4px;flex:1;max-width:180px">
           <div class="bar ${s.pct >= 80 ? 'hot' : ''}"><i style="width:${s.pct}%"></i></div>
           <div class="cap">${num(s.left)} de ${num(s.cap)} disponíveis</div>
@@ -323,8 +323,10 @@ async function vEvent(id) {
     getSettings()
   ]);
   if (!ev) return vMessage('Evento não encontrado', 'Ele pode ter sido removido ou ainda não foi publicado.');
-  const online = !!cfg.payments_enabled;
   const types = sortTypes(ev.ticket_types);
+  // Evento gratuito: todos os lotes a R$ 0. Inscrição confirmada na hora, sem pagamento, CPF nem taxa.
+  const free = types.length > 0 && types.every(t => Number(t.price) === 0);
+  const online = !!cfg.payments_enabled && !free;
   const cart = {};
   let method = 'pix';
   let inst = 1;
@@ -364,7 +366,7 @@ async function vEvent(id) {
         const k = t.id + '|' + kind, q = cart[k] || 0;
         const full = st !== 'on' || inCart(t.id) >= Math.min(left ?? 10, 10);
         return `<div class="lot"><div><div class="name">${esc(t.name)}${kind === 'meia' ? ' · Meia-entrada' : ''}</div>
-          <div class="price">${money(price)}${status}</div></div>
+          <div class="price">${price > 0 ? money(price) : 'Grátis'}${status}</div></div>
           ${past ? '' : `<div class="stepper"><button data-act="dec" data-k="${esc(k)}" ${q ? '' : 'disabled'} aria-label="Remover um">−</button><span>${q}</span><button data-act="inc" data-k="${esc(k)}" ${full ? 'disabled' : ''} aria-label="Adicionar um">+</button></div>`}</div>`;
       }).join('');
     }).join('') : '<p class="note">Os lotes ainda não foram cadastrados.</p>';
@@ -374,7 +376,7 @@ async function vEvent(id) {
     document.getElementById('summary').innerHTML = c.count
       ? `<div class="sum">${c.out.map(l => `<div><span>${l.qty}× ${esc(l.t.name)}${l.kind === 'meia' ? ' (meia)' : ''}</span><span>${money(l.unit * l.qty)}</span></div>`).join('')}
         ${coupon ? `<div style="color:var(--ok)"><span>Cupom ${esc(coupon.code)}</span><span>${c.discount ? '−' + money(c.discount) : 'não vale para estes ingressos'}</span></div>` : ''}
-        <div class="note"><span>Taxa de serviço (${num(ev.fee_pct)}%)</span><span>${money(c.fee)}</span></div>
+        ${free ? '<div class="note"><span>Evento gratuito</span><span>sem taxas</span></div>' : `<div class="note"><span>Taxa de serviço (${num(ev.fee_pct)}%)</span><span>${money(c.fee)}</span></div>`}
         ${online && c.pfee ? `<div class="note"><span>Taxa do ${method === 'pix' ? 'Pix' : 'cartão'}</span><span>${money(c.pfee)}</span></div>` : ''}
         <div class="total"><span>Total</span><span>${money(c.total)}</span></div>
         ${online && method === 'card' && inst > 1 ? `<div class="note"><span>Em ${inst}× no cartão</span><span>${fmtParcelas(c.total, inst)}</span></div>` : ''}</div>`
@@ -396,7 +398,7 @@ async function vEvent(id) {
       }
     }
     const btn = document.getElementById('buy-btn');
-    if (btn) { btn.disabled = !c.count; btn.textContent = !c.count ? (online ? 'Ir para o pagamento' : 'Confirmar pedido') : online ? `Pagar ${money(c.total)}` : `Confirmar ${c.count} ingresso${c.count > 1 ? 's' : ''}`; }
+    if (btn) { btn.disabled = !c.count; btn.textContent = !c.count ? (online ? 'Ir para o pagamento' : free ? 'Garantir meu lugar' : 'Confirmar pedido') : online ? `Pagar ${money(c.total)}` : free ? `Garantir ${c.count === 1 ? 'meu lugar' : c.count + ' lugares'}` : `Confirmar ${c.count} ingresso${c.count > 1 ? 's' : ''}`; }
   };
 
   const hasHalf = types.some(t => t.allows_half);
@@ -432,6 +434,8 @@ async function vEvent(id) {
           <button class="btn primary" id="buy-btn" type="submit" disabled>Ir para o pagamento</button>
           <p class="note">As vagas ficam reservadas por ${num(cfg.reservation_minutes || 15)} minutos enquanto você paga. Os ingressos com QR Code aparecem assim que o pagamento for aprovado.</p>
           <p class="note">Cancelamento: devolução integral em até 7 dias da compra; depois, desconta as taxas. Pedidos até 48 horas antes do evento. Evento cancelado pela organização: devolução integral. <a href="#/ajuda">Saiba mais</a>.</p>`
+          : free ? `<button class="btn primary" id="buy-btn" type="submit" disabled>Garantir meu lugar</button>
+          <p class="note">Evento gratuito: não há pagamento nem taxa. Seus ingressos com QR Code aparecem na hora e chegam no seu e-mail.</p>`
           : `<button class="btn primary" id="buy-btn" type="submit" disabled>Confirmar pedido</button>
           <p class="note">A reserva fica registrada e os códigos de entrada são emitidos na hora. O pagamento é combinado com quem organiza o evento.</p>`}
         </form>`
