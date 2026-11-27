@@ -8,7 +8,7 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%233346F0'/%3E%3Cpath d='M4 7h16v3a2 2 0 0 0 0 4v3H4v-3a2 2 0 0 0 0-4z' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;700&display=swap">
-  <link rel="stylesheet" href="assets/style.css">
+  <link rel="stylesheet" href="assets/style.css" id="css">
 </head>
 <body>
   <header class="topbar">
@@ -22,6 +22,31 @@
   </header>
   <main class="wrap" id="app"><p class="note">Carregando…</p></main>
   <div id="toast" role="status" aria-live="polite"></div>
-  <script type="module" src="assets/app.js"></script>
+  <script type="module">
+    // Sempre carrega a versão mais nova do site: pergunta ao servidor se os arquivos mudaram
+    // (resposta curta, sem baixar tudo de novo) e usa um endereço novo para cada versão.
+    const ver = async path => {
+      try {
+        const r = await fetch(path, { method: 'HEAD', cache: 'no-cache' });
+        return encodeURIComponent(r.headers.get('etag') || r.headers.get('last-modified') || Date.now());
+      } catch { return Date.now(); }
+    };
+    const [vApp, vCss] = await Promise.all([
+      ver('assets/app.js'), ver('assets/style.css'),
+      fetch('assets/config.js', { cache: 'no-cache' }).catch(() => {}),
+    ]);
+    const old = document.getElementById('css');
+    const css = Object.assign(document.createElement('link'), { rel: 'stylesheet', href: `assets/style.css?v=${vCss}` });
+    css.onload = () => old.remove();
+    old.after(css);
+    try {
+      await import(`./assets/app.js?v=${vApp}`);
+    } catch (e) {
+      console.error(e);
+      document.getElementById('app').innerHTML =
+        '<p class="note">Não foi possível carregar o site. Verifique a internet e tente de novo.</p>' +
+        '<p><button class="btn primary" onclick="location.reload()">Tentar de novo</button></p>';
+    }
+  </script>
 </body>
 </html>
