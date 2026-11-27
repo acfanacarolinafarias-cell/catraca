@@ -213,3 +213,13 @@ details.panel summary { cursor: pointer; font-family: var(--font-display); font-
 .lotbox .typerow { border-top: 0; padding: 8px 0 0; }
 .typerow.lotextra { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto auto; }
 @media (max-width: 640px) { .typerow.lotextra { grid-template-columns: 1fr 1fr; } }
+
+/* Login com Google */
+.btn.google { width: 100%; background: #fff; color: #1F1F1F; border-color: #DADCE0; }
+.btn.google:hover { border-color: #9AA0A6; }
+.or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.85rem; }
+.or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+
+/* Instalar o app */
+ol.steps { padding-left: 1.3em; margin: 8px 0; }
+ol.steps li { margin: 6px 0; }
