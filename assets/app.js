@@ -680,7 +680,8 @@ async function drawShareCard(o, format = 'square') {
   if (place) {
     const pf = scFit(ctx, place, s => `500 ${s}px ${SC_BODY}`, 34, 26, pw, 2);
     ctx.fillStyle = SC.muted; ctx.font = `500 ${pf.size}px ${SC_BODY}`;
-    ly += 14; for (const l of pf.lines) { ctx.fillText(l, px, ly); ly += pf.size * 1.3; }
+    ly = story ? Math.max(ly + 14, cut - 64 - (pf.lines.length - 1) * pf.size * 1.3) : ly + 14;
+    for (const l of pf.lines) { ctx.fillText(l, px, ly); ly += pf.size * 1.3; }
   }
   // Data no canhoto
   ctx.fillStyle = SC.onStub; ctx.textAlign = 'center';
