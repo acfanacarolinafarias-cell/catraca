@@ -204,6 +204,7 @@ async function route() {
       case 'nova-senha': return vNewPassword();
       case 'meus-ingressos': return requireLogin() && await vMyTickets();
       case 'ajuda': return vHelp();
+      case 'app': return vInstall();
       case 'painel':
         if (!requireLogin()) return;
         if (b === 'evento') return await vManage(c, d || 'info');
@@ -480,12 +481,57 @@ const FAQ = [
   ['E se o evento for adiado?', 'A organização avisa a nova data. Se você não puder ir, pode pedir o cancelamento nas mesmas condições de desistência.'],
   ['Onde ficam meus ingressos?', 'Em “Meus ingressos”, assim que o pagamento é aprovado. Cada ingresso tem um QR Code, que é lido na entrada. Cada código vale uma entrada.'],
   ['Comprei meia-entrada. O que preciso levar?', 'O documento que comprova o direito à meia-entrada (Lei 12.933/2013). Ele é conferido na entrada.'],
+  ['Dá para usar a Catraca como aplicativo no celular?', 'Sim. Salve o site na tela inicial do celular: ele ganha um ícone e abre em tela cheia, como um app, sem precisar baixar nada da loja. Veja o passo a passo em “Instalar o app”, no fim desta página.'],
   ['O prazo para pagar acabou. E agora?', 'As vagas voltam para a venda e a cobrança é cancelada. Se ainda houver ingressos, faça um novo pedido.'],
 ];
 function vHelp() {
   mount(`<div class="page-head"><div><div class="eyebrow">Ajuda</div><h1>Dúvidas frequentes</h1>
       <p>Compras, pagamentos, cancelamentos e ingressos.</p></div></div>
-    <div class="panel medium" style="width:100%">${FAQ.map(([q, a]) => `<details><summary><b>${esc(q)}</b></summary><p>${esc(a)}</p></details>`).join('')}</div>`);
+    <div class="panel medium" style="width:100%">${FAQ.map(([q, a]) => `<details><summary><b>${esc(q)}</b></summary><p>${esc(a)}</p></details>`).join('')}</div>
+    <p style="margin-top:16px"><a class="btn" href="#/app">📱 Instalar o app no celular</a></p>`);
+}
+
+/* ================= instalar como app ================= */
+let installPrompt = null;   // Android/Chrome: o navegador oferece instalar direto
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installPrompt = e; if (location.hash === '#/app') vInstall(); });
+window.addEventListener('appinstalled', () => { installPrompt = null; if (location.hash === '#/app') vInstall(); });
+function vInstall() {
+  const ua = navigator.userAgent;
+  const ios = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const installed = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  const android = `<div class="panel" style="flex:1;min-width:260px">
+      <h2>Android</h2>
+      ${installPrompt ? `<p><button class="btn primary" data-act="install">Instalar agora</button></p><p class="note">Ou, se preferir, pelo menu do navegador:</p>` : ''}
+      <ol class="steps">
+        <li>Abra o site no <b>Chrome</b>.</li>
+        <li>Toque nos <b>três pontinhos</b> (⋮), no canto de cima, à direita.</li>
+        <li>Toque em <b>Adicionar à tela inicial</b> (em alguns celulares aparece <b>Instalar app</b>).</li>
+        <li>Confirme em <b>Instalar</b> ou <b>Adicionar</b>.</li>
+      </ol>
+      <p class="note">No navegador da Samsung: toque no menu (☰) e depois em <b>Adicionar página a</b> → <b>Tela inicial</b>.</p></div>`;
+  const iphone = `<div class="panel" style="flex:1;min-width:260px">
+      <h2>iPhone</h2>
+      <ol class="steps">
+        <li>Abra o site no <b>Safari</b>.</li>
+        <li>Toque no botão <b>Compartilhar</b> (o quadrado com uma seta para cima), na barra de baixo.</li>
+        <li>Role as opções e toque em <b>Adicionar à Tela de Início</b>.</li>
+        <li>Toque em <b>Adicionar</b>, no canto de cima.</li>
+      </ol>
+      <p class="note">Em outros navegadores do iPhone, como o Chrome, o botão Compartilhar fica na barra de endereço.</p></div>`;
+  mount(`<div class="page-head"><div><div class="eyebrow">Ajuda</div><h1>Instalar o app</h1>
+      <p>Salve a Catraca na tela inicial do celular: ela ganha um ícone e abre em tela cheia, como um aplicativo. Não precisa baixar nada da loja e os ingressos ficam a um toque.</p></div></div>
+    ${installed ? '<div class="msg ok" style="margin-bottom:16px">Você já está usando a Catraca como app neste aparelho.</div>' : ''}
+    <div class="row" style="align-items:stretch;gap:16px;flex-wrap:wrap">${ios ? iphone + android : android + iphone}</div>
+    <p style="margin-top:16px"><a href="#/ajuda">← Voltar para as dúvidas</a></p>`, {
+    install: async () => {
+      if (!installPrompt) return;
+      installPrompt.prompt();
+      const { outcome } = await installPrompt.userChoice;
+      installPrompt = null;
+      if (outcome === 'accepted') toast('Pronto! A Catraca está na sua tela inicial.');
+      vInstall();
+    }
+  });
 }
 
 function passList(tickets) {
@@ -622,6 +668,7 @@ async function vMyTickets() {
 }
 
 /* ================= login ================= */
+const GOOGLE_G = `<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg>`;
 function vLogin(mode) {
   const tabs = [['entrar', 'Entrar'], ['criar-conta', 'Criar conta'], ['esqueci', 'Esqueci a senha']];
   const body = {
@@ -640,13 +687,23 @@ function vLogin(mode) {
         <button class="btn primary" type="submit">Enviar link para nova senha</button>
         <p class="note">Abra o link no mesmo navegador em que você pediu.</p></form>`
   }[mode] || '';
+  const google = mode === 'esqueci' ? '' : `
+    <button class="btn google" type="button" data-act="google">${GOOGLE_G} Continuar com o Google</button>
+    <div class="or"><span>ou com e-mail e senha</span></div>`;
   mount(`<div class="panel narrow">
     <div><div class="eyebrow">Sua conta</div><h1 style="font-size:1.8rem">Acesse a Catraca</h1>
     <p class="note">A mesma conta serve para comprar ingressos e, se você organiza eventos, para gerenciá-los.</p></div>
     <nav class="subtabs">${tabs.map(([k, t]) => `<a href="#/entrar/${k}" ${k === mode ? 'aria-current="page"' : ''}>${t}</a>`).join('')}</nav>
     <div id="auth-msg"></div>
+    ${google}
     ${body}
-  </div>`, {}, {
+  </div>`, {
+    google: async b => {
+      b.disabled = true;
+      const { error } = await sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: BASE_URL } });
+      if (error) { b.disabled = false; toast(errMsg(error), 'bad'); }
+    }
+  }, {
     login: async fd => {
       const { error } = await sb.auth.signInWithPassword({ email: fd.get('email'), password: fd.get('password') });
       if (error) throw error;
@@ -1427,6 +1484,10 @@ async function start() {
   const { data } = await sb.auth.getSession();
   await loadMe(data.session);
   booted = true;
+  if (qs.has('code') && me.user && !recovery) {
+    let next = ''; try { next = sessionStorage.getItem('next') || ''; sessionStorage.removeItem('next'); } catch (_) {}
+    if (!location.hash || location.hash === '#/' || location.hash.startsWith('#/entrar')) history.replaceState(null, '', location.pathname + (next || homeFor()));
+  }
   if (location.search) history.replaceState(null, '', location.pathname + location.hash);
   if (recovery && me.user) location.hash = '#/nova-senha';
   window.addEventListener('hashchange', route);
