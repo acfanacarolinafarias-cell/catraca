@@ -254,9 +254,6 @@ const lotState = t => {
   return 'on';
 };
 const fmtDT = iso => new Date(iso).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).replace(',', ' às');
-// datetime-local (hora local do navegador) <-> ISO
-const toLocalInput = iso => { if (!iso) return ''; const d = new Date(iso); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
-const fromLocalInput = v => v ? new Date(v).toISOString() : null;
 
 function evStats(ev) {
   const ts = ev.ticket_types || [];
