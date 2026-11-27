@@ -48,10 +48,11 @@ function confirmationMail(o: any) {
     <p style="margin:0 0 4px">${esc(when(ev.starts_at))}</p>
     <p style="margin:0 0 16px">${esc(ev.venue)}${ev.city ? ' · ' + esc(ev.city) : ''}</p>
     <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;border-top:1px solid #D4D9E6;border-bottom:1px solid #D4D9E6;margin:0 0 12px">${list}</table>
-    <p style="margin:0">Total pago: <b>${money(o.total)}</b>${esc(parc)}</p>
+    <p style="margin:0">${Number(o.total) > 0 ? `Total pago: <b>${money(o.total)}</b>${esc(parc)}` : '<b>Evento gratuito</b> · sem nenhuma cobrança'}</p>
     ${button(link, 'Ver meus ingressos com QR Code')}
     <p style="margin:0 0 8px;font-size:14px;color:#454E6B">Na entrada, mostre o QR Code de cada ingresso. Cada código vale uma entrada. Quem comprou meia-entrada precisa levar o documento que comprova o direito.</p>
-    <p style="margin:0;font-size:13px;color:#59627E">Cancelamento: devolução integral em até 7 dias da compra; depois, desconta as taxas. Pedidos até 48 horas antes do evento. <a href="${SITE_URL}#/ajuda" style="color:#3346F0">Saiba mais</a>.</p>`);
+    ${Number(o.total) > 0 ? '' : '<p style="margin:0;font-size:13px;color:#59627E">Não vai poder ir? Avise a organização para liberar a vaga para outra pessoa.</p>'}
+    <p style="margin:0;font-size:13px;color:#59627E;${Number(o.total) > 0 ? '' : 'display:none'}">Cancelamento: devolução integral em até 7 dias da compra; depois, desconta as taxas. Pedidos até 48 horas antes do evento. <a href="${SITE_URL}#/ajuda" style="color:#3346F0">Saiba mais</a>.</p>`);
   const text = `Olá, ${o.buyer_name}! Seu pedido ${o.code} está confirmado.
 
 ${ev.name}
@@ -61,12 +62,12 @@ ${ev.venue}${ev.city ? ' · ' + ev.city : ''}
 Ingressos:
 ${tks.map((t: any) => `- ${t.code}: ${t.type_name}${t.kind === 'meia' ? ' (meia-entrada)' : ''}`).join('\n')}
 
-Total pago: ${money(o.total)}${parc}
+${Number(o.total) > 0 ? `Total pago: ${money(o.total)}${parc}` : 'Evento gratuito, sem nenhuma cobrança.'}
 
 Ver meus ingressos com QR Code: ${link}
 
-Na entrada, mostre o QR Code de cada ingresso. Cancelamento: devolução integral em até 7 dias da compra; depois, desconta as taxas. Pedidos até 48 horas antes do evento. Mais em ${SITE_URL}#/ajuda`;
-  return { subject: `Seus ingressos para ${ev.name} · pedido ${o.code}`, html, text };
+Na entrada, mostre o QR Code de cada ingresso. ${Number(o.total) > 0 ? 'Cancelamento: devolução integral em até 7 dias da compra; depois, desconta as taxas. Pedidos até 48 horas antes do evento.' : 'Não vai poder ir? Avise a organização para liberar a vaga.'} Mais em ${SITE_URL}#/ajuda`;
+  return { subject: `${Number(o.total) > 0 ? 'Seus ingressos' : 'Inscrição confirmada'} para ${ev.name} · pedido ${o.code}`, html, text };
 }
 
 function refundMail(o: any) {
