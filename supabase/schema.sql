@@ -702,8 +702,9 @@ begin
 
   -- Taxa de serviço e cobrança da plataforma: sobre o preço cheio
   v_fee  := round(v_subtotal * v_event.fee_pct / 100, 2);
+  -- Ingressos gratuitos (preço zero) não pagam a cobrança fixa da plataforma
   v_comm := case when v_event.platform_fee_type = 'fixed'
-                 then round(v_n * v_event.platform_fee_fixed, 2)
+                 then round((select count(*) from public.tickets t where t.order_id = v_order and t.unit_price > 0) * v_event.platform_fee_fixed, 2)
                  else round(v_subtotal * v_event.platform_pct / 100, 2) end;
   if v_event.organizer_id is not null then
     v_split  := case when v_online then cfg.split_fee_fixed else 0 end;
