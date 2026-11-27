@@ -200,6 +200,8 @@ async function route() {
       case undefined: return await vHome();
       case 'evento': return await vEvent(b);
       case 'pedido': return requireLogin() && await vOrder(b);
+      case 'convite': return await vInvite(b);
+      case 'ingresso': return await vGuestTicket(b);
       case 'pagamento': return requireLogin() && await vPay(b);
       case 'entrar': return me.user ? go(homeFor()) : vLogin(b || 'entrar');
       case 'nova-senha': return vNewPassword();
@@ -876,9 +878,52 @@ async function vPay(id) {
   }, 4000);
 }
 
+/* ================= convites ================= */
+// Link secreto do lote de convidados: quem tem o link pega o próprio ingresso (um por conta)
+async function vInvite(code) {
+  loading();
+  const { data: inv, error } = await sb.rpc('invite_info', { p_code: code || '' });
+  if (error) return vMessage('Convite indisponível', errMsg(error));
+  if (!inv) return vMessage('Convite indisponível', 'Este convite não existe, foi desativado ou o evento já aconteceu.');
+  const head = `<div class="panel narrow"><div class="eyebrow">Convite</div><h1 style="font-size:1.8rem">${esc(inv.event)}</h1>
+    <p class="note">${esc(fmtLong(inv.starts_at))} · ${esc(inv.venue || '')}${inv.city ? ', ' + esc(inv.city) : ''}</p>`;
+  if (!me.user) return mount(head + `<div class="msg info">Você recebeu um convite (${esc(inv.lot)}). Entre ou crie sua conta para pegar o seu ingresso.</div>
+      <button class="btn primary" data-act="login">Entrar para pegar o convite</button></div>`, { login: () => requireLogin() });
+  if (inv.claimed) return mount(head + `<div class="msg ok">Você já pegou o seu convite para este evento.</div><a class="btn primary" href="#/meus-ingressos">Ver meus ingressos</a></div>`);
+  if (!(inv.left > 0)) return mount(head + `<div class="msg bad">Os convites deste link acabaram. Fale com quem te convidou.</div></div>`);
+  mount(head + `<form data-form="claim" class="panel" style="padding:0;border:0">
+      <div class="field"><label for="g-name">Nome no ingresso</label><input id="g-name" name="name" required autocomplete="name" value="${esc(me.profile?.full_name || '')}"></div>
+      <button class="btn primary" type="submit">Pegar meu convite</button>
+      <p class="note">Convite gratuito (${esc(inv.lot)}). O ingresso com QR Code aparece na hora e chega no seu e-mail.</p></form></div>`, {}, {
+    claim: async fd => {
+      const { data, error } = await sb.rpc('claim_invite', { p_code: code, p_name: String(fd.get('name') || '').trim() });
+      if (error) { toast(errMsg(error), 'bad'); return vInvite(code); }
+      go('#/pedido/' + data);
+    }
+  });
+}
+
+// Ingresso de convidado pelo link do e-mail, sem precisar de conta
+async function vGuestTicket(token) {
+  loading();
+  const { data: g, error } = await sb.rpc('guest_ticket', { p_token: token });
+  if (error || !g) return vMessage('Ingresso não encontrado', 'O convite pode ter sido cancelado. Fale com quem te convidou.');
+  mount(`<div class="panel medium" style="width:100%">
+    <div class="msg ok">Convite ${esc(g.code)} confirmado. Mostre os códigos abaixo na entrada.</div>
+    <div class="row between"><h2>${esc(g.event?.name)}</h2><span class="note">${esc(fmtLong(g.event?.starts_at))}</span></div>
+    <p class="note">Em nome de <b>${esc(g.buyer_name)}</b> · ${esc(g.event?.venue || '')}</p>
+    ${passList(g.tickets)}
+    <p class="note">Guarde este link: ele é o seu acesso ao ingresso. Não compartilhe, porque cada código vale uma entrada.</p>
+  </div>`);
+  drawQRs();
+}
+
 async function vMyTickets() {
   loading();
-  const orders = must(await sb.from('orders').select(ORDER_FIELDS).eq('buyer_id', me.user.id).neq('status', 'canceled').order('created_at', { ascending: false }));
+  const mail = String(me.user.email || '').toLowerCase();
+  // Convites que o próprio organizador emitiu para outras pessoas não entram na carteira dele
+  const orders = must(await sb.from('orders').select(ORDER_FIELDS).eq('buyer_id', me.user.id).neq('status', 'canceled')
+    .or(`issued_by.is.null,issued_by.neq.${me.user.id},buyer_email.eq.${mail}`).order('created_at', { ascending: false }));
   const head = `<div class="page-head"><div><div class="eyebrow">Carteira</div><h1>Meus ingressos</h1><p>Cada código vale uma entrada. Depois de validado na porta, o ingresso aparece como utilizado.</p></div></div>`;
   if (!orders.length) return mount(head + `<div class="empty"><h2>Você ainda não tem ingressos</h2><p>Escolha um evento na programação.</p><a class="btn primary" href="#/">Ver eventos</a></div>`);
   mount(head + orders.map(o => `<div class="panel">
@@ -1141,8 +1186,38 @@ async function mInfo(ev, header, reload, admin) {
   });
 }
 
-function mLotes(ev, header, reload) {
+async function mLotes(ev, header, reload) {
   const types = sortTypes(ev.ticket_types);
+  const guestLots = types.filter(t => t.hidden);
+  // Convites já emitidos ou pegos pelo link, por lote de convidados
+  const guestTickets = guestLots.length ? must(await sb.from('tickets').select('code,checked_in_at,ticket_type_id,orders!inner(id,buyer_name,buyer_email,status,issued_by,guest_token,created_at)')
+    .in('ticket_type_id', guestLots.map(t => t.id)).eq('orders.status', 'confirmed')) : [];
+  const guestOrders = lot => {
+    const m = new Map();
+    for (const k of guestTickets.filter(k => k.ticket_type_id === lot.id)) {
+      const o = m.get(k.orders.id) || { ...k.orders, n: 0, used: 0 }; o.n++; if (k.checked_in_at) o.used++; m.set(k.orders.id, o);
+    }
+    return [...m.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
+  };
+  const inviteUrl = c => `${BASE_URL}#/convite/${c}`;
+  const guestPanel = t => { const list = guestOrders(t); return `<div class="panel" style="background:var(--surface-2)">
+    <div class="row between"><h3 style="margin:0">Convidados · ${esc(t.name)}</h3><span class="chip">${num(t.sold)} de ${num(t.capacity)} convites usados</span></div>
+    <form class="row" data-form="guest" data-id="${esc(t.id)}" style="flex-wrap:wrap;align-items:flex-end">
+      <div class="field" style="flex:1;min-width:180px"><label for="gn-${esc(t.id)}">Nome do convidado</label><input id="gn-${esc(t.id)}" name="name" required></div>
+      <div class="field" style="flex:1;min-width:200px"><label for="ge-${esc(t.id)}">E-mail (o ingresso vai para ele)</label><input id="ge-${esc(t.id)}" name="email" type="email" required></div>
+      <div class="field" style="width:90px"><label for="gq-${esc(t.id)}">Ingressos</label><input id="gq-${esc(t.id)}" name="qty" type="number" min="1" max="10" value="1"></div>
+      <button class="btn primary small" type="submit">Emitir convite</button>
+    </form>
+    <div class="field"><span class="label">Link de convite</span>
+      ${t.invite_code ? `<div class="row"><input class="input mono" readonly value="${esc(inviteUrl(t.invite_code))}" style="flex:1;min-width:0" data-act="sel"><button class="btn small" type="button" data-act="copy-invite" data-url="${esc(inviteUrl(t.invite_code))}">Copiar</button><button class="btn small" type="button" data-act="invite-new" data-id="${esc(t.id)}">Trocar link</button><button class="btn small danger" type="button" data-act="invite-off" data-id="${esc(t.id)}">Desativar</button></div>
+        <span class="note">Quem tem o link pega um convite por conta, até acabar a quantidade do lote. Trocar o link invalida o anterior.</span>`
+      : `<div class="row"><button class="btn small" type="button" data-act="invite-on" data-id="${esc(t.id)}">Criar link de convite</button><span class="note">Para mandar a um grupo (imprensa, parceiros) em vez de emitir um por um.</span></div>`}</div>
+    ${list.length ? `<div class="tablewrap"><table><thead><tr><th>Convidado</th><th>E-mail</th><th>Origem</th><th class="num">Ingressos</th><th>Entrada</th><th></th></tr></thead><tbody>
+      ${list.map(o => `<tr><td>${esc(o.buyer_name)}</td><td>${esc(o.buyer_email)}</td><td>${o.issued_by ? 'Emitido' : 'Link'}</td><td class="num">${num(o.n)}</td>
+        <td>${o.used ? `<span class="chip ok">${num(o.used)} entrou</span>` : '<span class="chip">Ainda não</span>'}</td>
+        <td class="num">${o.used ? '' : `<button class="btn small danger" type="button" data-act="guest-cancel" data-id="${esc(o.id)}">Cancelar</button>`}</td></tr>`).join('')}
+    </tbody></table></div>` : '<p class="note">Nenhum convite ainda.</p>'}
+  </div>`; };
   const stLabel = { on: 'à venda', soon: 'ainda não começou', ended: 'período encerrado', soldout: 'esgotado' };
   // Segunda linha do lote: período de vendas e se o comprador vê a quantidade
   const extra = (t, p) => `<div class="typerow lotextra">
@@ -1157,23 +1232,25 @@ function mLotes(ev, header, reload) {
   const halfField = (on) => free ? '<span></span>' : `<label class="check" style="padding-bottom:9px"><input type="checkbox" name="allows_half" ${on ? 'checked' : ''}> Meia</label>`;
   const row = (t, i) => `<form class="lotbox" data-form="type" data-id="${esc(t.id)}">
     <div class="typerow">
-    <div class="field"><label for="t-name-${i}">Nome do lote / setor <span class="note">(${stLabel[lotState(t)]})</span></label><input id="t-name-${i}" name="name" required value="${esc(t.name)}"></div>
-    ${priceField('t-price-' + i, t.price)}
+    <div class="field"><label for="t-name-${i}">Nome do lote / setor <span class="note">(${t.hidden ? 'convidados · não aparece na página' : stLabel[lotState(t)]})</span></label><input id="t-name-${i}" name="name" required value="${esc(t.name)}"></div>
+    ${t.hidden ? `<div class="field"><span class="label">Preço</span><input type="hidden" name="price" value="0"><div class="input" style="background:var(--surface-2)">Cortesia</div></div>` : priceField('t-price-' + i, t.price)}
     <div class="field"><label for="t-cap-${i}">Quantidade (vendidos: ${num(t.sold)})</label><input id="t-cap-${i}" name="capacity" type="number" min="${t.sold}" step="1" required value="${esc(t.capacity)}"></div>
-    ${halfField(t.allows_half)}
+    ${t.hidden ? '<span></span>' : halfField(t.allows_half)}
     <div class="row" style="padding-bottom:2px"><button class="btn small" type="submit">Salvar</button>${t.sold ? '' : `<button class="btn small danger" type="button" data-act="del" data-id="${esc(t.id)}" aria-label="Excluir lote">Excluir</button>`}</div>
     </div>${extra(t, 't' + i)}
   </form>`;
   const read = fd => {
     const start = fromLocalInput(String(fd.get('sales_start') || '')), end = fromLocalInput(String(fd.get('sales_end') || ''));
     if (start && end && new Date(end) <= new Date(start)) throw new Error('O fim das vendas precisa ser depois do início.');
-    return { name: String(fd.get('name')).trim(), price: Number(fd.get('price')) || 0, capacity: Math.max(0, Math.floor(Number(fd.get('capacity')) || 0)),
-             allows_half: fd.get('allows_half') === 'on', sales_start: start, sales_end: end, show_remaining: fd.get('show_remaining') === 'on' };
+    const hidden = fd.get('hidden') === 'on';
+    return { name: String(fd.get('name')).trim(), price: hidden ? 0 : Number(fd.get('price')) || 0, capacity: Math.max(0, Math.floor(Number(fd.get('capacity')) || 0)),
+             allows_half: !hidden && fd.get('allows_half') === 'on', sales_start: start, sales_end: end, show_remaining: fd.get('show_remaining') === 'on' };
   };
   mount(header + `<div class="panel">
     <div><h2>Lotes e setores</h2>${free ? '<div class="msg ok" style="margin:8px 0">Evento gratuito: todos os lotes são grátis. Defina só o nome, a quantidade de vagas e, se quiser, o período de inscrição.</div>' : ''}<p class="note">A meia-entrada custa metade da inteira e usa a mesma quantidade do lote. Cada lote para de vender no que vier primeiro: acabar a quantidade ou passar o fim do período. Por padrão, o comprador não vê quantos ingressos restam. Lotes com vendas não podem ser excluídos; diminua a quantidade até o total vendido para encerrar.</p></div>
     <div>${types.length ? types.map(row).join('') : '<p class="note">Nenhum lote ainda.</p>'}</div>
   </div>
+  ${guestLots.map(guestPanel).join('')}
   <form class="panel" data-form="new"><h2>Novo lote</h2>
     <div class="typerow" style="border:0;padding:0">
       <div class="field"><label for="nt-name">Nome</label><input id="nt-name" name="name" required placeholder="Pista · 1º lote"></div>
@@ -1183,15 +1260,31 @@ function mLotes(ev, header, reload) {
       <div style="padding-bottom:2px"><button class="btn primary small" type="submit">Adicionar</button></div>
     </div>
     ${extra(null, 'nt')}
+    <label class="check"><input type="checkbox" name="hidden" data-change="hidden-lot"> <span><b>Lote de convidados (cortesia)</b>: gratuito e fora da página do evento. Você emite os convites aqui ou libera um link secreto.</span></label>
   </form>`, {
     del: async b => {
       const { error } = await sb.from('ticket_types').delete().eq('id', b.dataset.id);
       if (error) return toast(errMsg(error), 'bad');
       toast('Lote excluído.'); reload();
     }
+    , 'change:hidden-lot': el => { const f = el.closest('form'); const pr = f.querySelector('[name=price]'); if (pr && pr.type !== 'hidden') { pr.disabled = el.checked; if (el.checked) pr.value = 0; pr.required = !el.checked; } const h = f.querySelector('[name=allows_half]'); if (h) { h.disabled = el.checked; if (el.checked) h.checked = false; } },
+    sel: el => el.select(),
+    'copy-invite': async b => { try { await navigator.clipboard.writeText(b.dataset.url); toast('Link de convite copiado.'); } catch (_) { toast('Selecione o link e copie.', 'bad'); } },
+    'invite-on': async b => { const { error } = await sb.rpc('set_invite_link', { p_type: b.dataset.id, p_on: true }); if (error) return toast(errMsg(error), 'bad'); reload(); },
+    'invite-new': async b => { const { error } = await sb.rpc('set_invite_link', { p_type: b.dataset.id, p_on: true }); if (error) return toast(errMsg(error), 'bad'); toast('Link trocado. O anterior não funciona mais.'); reload(); },
+    'invite-off': async b => { const { error } = await sb.rpc('set_invite_link', { p_type: b.dataset.id, p_on: false }); if (error) return toast(errMsg(error), 'bad'); toast('Link desativado.'); reload(); },
+    'guest-cancel': async b => { const { error } = await sb.rpc('cancel_guest', { p_order: b.dataset.id }); if (error) return toast(errMsg(error), 'bad'); toast('Convite cancelado. A vaga voltou para o lote.'); reload(); }
   }, {
-    type: async (fd, f) => { must(await sb.from('ticket_types').update(read(fd)).eq('id', f.dataset.id)); toast('Lote salvo.'); reload(); },
-    new: async fd => { must(await sb.from('ticket_types').insert({ ...read(fd), event_id: ev.id, sort: types.length })); toast('Lote adicionado.'); reload(); }
+    type: async (fd, f) => {
+      const body = read(fd); if (types.find(t => t.id === f.dataset.id)?.hidden) { body.price = 0; body.allows_half = false; }
+      must(await sb.from('ticket_types').update(body).eq('id', f.dataset.id)); toast('Lote salvo.'); reload();
+    },
+    new: async fd => { must(await sb.from('ticket_types').insert({ ...read(fd), hidden: fd.get('hidden') === 'on', event_id: ev.id, sort: types.length })); toast('Lote adicionado.'); reload(); },
+    guest: async (fd, f) => {
+      const { error } = await sb.rpc('issue_guest', { p_type: f.dataset.id, p_name: String(fd.get('name') || '').trim(), p_email: String(fd.get('email') || '').trim(), p_qty: Math.max(1, Math.min(10, Number(fd.get('qty')) || 1)) });
+      if (error) return toast(errMsg(error), 'bad');
+      toast('Convite emitido. O ingresso chega no e-mail do convidado em instantes.'); reload();
+    }
   });
 }
 

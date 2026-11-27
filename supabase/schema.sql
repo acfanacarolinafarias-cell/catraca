@@ -102,6 +102,14 @@ create index if not exists ticket_types_event_idx on public.ticket_types (event_
 alter table public.ticket_types add column if not exists sales_start    timestamptz;
 alter table public.ticket_types add column if not exists sales_end      timestamptz;
 alter table public.ticket_types add column if not exists show_remaining boolean not null default false;
+-- Lote de convidados (cortesia): gratuito, não aparece na página do evento.
+-- O organizador emite os ingressos pelo painel ou libera um link secreto (invite_code).
+alter table public.ticket_types add column if not exists hidden      boolean not null default false;
+alter table public.ticket_types add column if not exists invite_code text;
+create unique index if not exists ticket_types_invite_code_key on public.ticket_types (invite_code) where invite_code is not null;
+do $$ begin
+  alter table public.ticket_types add constraint ticket_types_hidden_free_check check (not hidden or price = 0);
+exception when duplicate_object then null; end $$;
 do $$ begin
   alter table public.ticket_types add constraint ticket_types_sales_window_check
     check (sales_start is null or sales_end is null or sales_end > sales_start);
@@ -463,6 +471,10 @@ alter table public.orders add column if not exists provider_data       jsonb;
 alter table public.orders add column if not exists provider_canceled_at timestamptz;
 alter table public.orders add column if not exists paid_at             timestamptz;
 alter table public.orders add column if not exists installments        integer not null default 1;
+-- Ingresso de convidado emitido pelo organizador: link secreto para o convidado ver os QR Codes sem conta
+alter table public.orders add column if not exists guest_token         uuid;
+alter table public.orders add column if not exists issued_by           uuid references auth.users(id) on delete set null;
+create unique index if not exists orders_guest_token_key on public.orders (guest_token) where guest_token is not null;
 do $$ begin
   alter table public.orders add constraint orders_status_check
     check (status in ('pending', 'confirmed', 'expired', 'canceled', 'refunded', 'refund_needed'));
@@ -656,7 +668,7 @@ begin
     group by 1 order by 1
   loop
     select * into v_type from public.ticket_types
-      where id = r.type_id and event_id = p_event for update;
+      where id = r.type_id and event_id = p_event and not hidden for update;
     if not found then
       raise exception 'Lote inválido para este evento.';
     end if;
@@ -846,6 +858,125 @@ begin
   update public.orders set status = 'refunded' where id = p_order and status = 'refund_needed';
 end $$;
 
+-- ---------- Convidados (lotes de cortesia) ----------
+
+-- Cria o pedido gratuito e os ingressos de um lote de convidados (uso interno)
+create or replace function public.guest_order(p_type uuid, p_qty integer, p_name text, p_email text, p_buyer uuid, p_issuer uuid)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare
+  t public.ticket_types%rowtype; v_order uuid; v_code text;
+begin
+  select * into t from public.ticket_types where id = p_type and hidden for update;
+  if not found then raise exception 'Lote de convidados não encontrado.'; end if;
+  if coalesce(trim(p_name), '') = '' then raise exception 'Informe o nome do convidado.'; end if;
+  if p_qty < 1 or p_qty > 10 then raise exception 'Escolha entre 1 e 10 ingressos.'; end if;
+  if t.sold + p_qty > t.capacity then
+    raise exception 'Os convites deste lote acabaram (% de %).', t.sold, t.capacity;
+  end if;
+  update public.ticket_types set sold = sold + p_qty where id = t.id;
+  loop
+    v_code := public.gen_code(6);
+    exit when not exists (select 1 from public.orders where code = v_code);
+  end loop;
+  insert into public.orders (code, event_id, buyer_id, buyer_name, buyer_email, subtotal, fee, total,
+                             payment_method, status, paid_at, guest_token, issued_by)
+  values (v_code, t.event_id, p_buyer, trim(p_name), lower(coalesce(trim(p_email), '')), 0, 0, 0,
+          'free', 'confirmed', now(), gen_random_uuid(), p_issuer)
+  returning id into v_order;
+  for i in 1 .. p_qty loop
+    insert into public.tickets (code, order_id, event_id, ticket_type_id, type_name, kind, unit_price)
+    values (v_code || '-' || i, v_order, t.event_id, t.id, t.name, 'inteira', 0);
+  end loop;
+  return v_order;
+end $$;
+
+-- Organizador emite convite pelo painel: nome e e-mail do convidado
+create or replace function public.issue_guest(p_type uuid, p_name text, p_email text, p_qty integer default 1)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare v_event uuid; v_buyer uuid;
+begin
+  select event_id into v_event from public.ticket_types where id = p_type and hidden;
+  if v_event is null or not public.can_manage_event(v_event) then
+    raise exception 'Você não pode emitir convites para este evento.';
+  end if;
+  if coalesce(trim(p_email), '') !~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' then
+    raise exception 'Informe um e-mail válido para enviar o ingresso.';
+  end if;
+  -- Se o convidado já tem conta com esse e-mail, o ingresso aparece em "Meus ingressos"
+  select id into v_buyer from auth.users where lower(email) = lower(trim(p_email)) limit 1;
+  return public.guest_order(p_type, p_qty, p_name, p_email, coalesce(v_buyer, auth.uid()), auth.uid());
+end $$;
+
+-- Liga, troca ou desliga o link secreto do lote de convidados
+create or replace function public.set_invite_link(p_type uuid, p_on boolean) returns text
+language plpgsql security definer set search_path = public as $$
+declare v_event uuid; v_code text;
+begin
+  select event_id into v_event from public.ticket_types where id = p_type and hidden;
+  if v_event is null or not public.can_manage_event(v_event) then
+    raise exception 'Você não pode alterar este lote.';
+  end if;
+  v_code := case when p_on then lower(public.gen_code(10)) end;
+  update public.ticket_types set invite_code = v_code where id = p_type;
+  return v_code;
+end $$;
+
+-- Página do convite (link secreto): mostra o evento e quantos convites restam
+create or replace function public.invite_info(p_code text) returns jsonb
+language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('event_id', e.id, 'event', e.name, 'starts_at', e.starts_at, 'venue', e.venue, 'city', e.city,
+    'lot', t.name, 'left', greatest(t.capacity - t.sold, 0),
+    'claimed', exists (select 1 from public.orders o join public.tickets k on k.order_id = o.id
+                       where k.ticket_type_id = t.id and o.buyer_id = auth.uid() and o.status = 'confirmed'))
+  from public.ticket_types t join public.events e on e.id = t.event_id
+  where t.invite_code = lower(trim(p_code)) and t.hidden and e.published and e.starts_at > now() - interval '6 hours';
+$$;
+
+-- Quem tem o link pega o próprio convite (um por conta)
+create or replace function public.claim_invite(p_code text, p_name text) returns uuid
+language plpgsql security definer set search_path = public as $$
+declare t public.ticket_types%rowtype; v_email text;
+begin
+  if auth.uid() is null then raise exception 'Entre na sua conta para pegar o convite.'; end if;
+  select tt.* into t from public.ticket_types tt join public.events e on e.id = tt.event_id
+    where tt.invite_code = lower(trim(p_code)) and tt.hidden and e.published and e.starts_at > now() - interval '6 hours';
+  if not found then raise exception 'Este convite não existe ou não está mais ativo.'; end if;
+  if exists (select 1 from public.orders o join public.tickets k on k.order_id = o.id
+             where k.ticket_type_id = t.id and o.buyer_id = auth.uid() and o.status = 'confirmed') then
+    raise exception 'Você já pegou o seu convite para este evento.';
+  end if;
+  select email into v_email from auth.users where id = auth.uid();
+  return public.guest_order(t.id, 1, p_name, v_email, auth.uid(), null);
+end $$;
+
+-- Ingresso de convidado pelo link do e-mail (sem precisar de conta)
+create or replace function public.guest_ticket(p_token uuid) returns jsonb
+language sql stable security definer set search_path = public as $$
+  select jsonb_build_object('code', o.code, 'status', o.status, 'buyer_name', o.buyer_name,
+    'event', jsonb_build_object('id', e.id, 'name', e.name, 'starts_at', e.starts_at, 'venue', e.venue, 'city', e.city),
+    'tickets', coalesce((select jsonb_agg(jsonb_build_object('code', k.code, 'type_name', k.type_name, 'kind', k.kind, 'checked_in_at', k.checked_in_at) order by k.code)
+                         from public.tickets k where k.order_id = o.id), '[]'::jsonb))
+  from public.orders o join public.events e on e.id = o.event_id
+  where o.guest_token = p_token and o.status = 'confirmed';
+$$;
+
+-- Organizador cancela um convite emitido (a vaga volta para o lote)
+create or replace function public.cancel_guest(p_order uuid) returns void
+language plpgsql security definer set search_path = public as $$
+declare o public.orders%rowtype;
+begin
+  select * into o from public.orders where id = p_order and guest_token is not null for update;
+  if not found or not public.can_manage_event(o.event_id) then
+    raise exception 'Convite não encontrado.';
+  end if;
+  if o.status <> 'confirmed' then return; end if;
+  if exists (select 1 from public.tickets where order_id = o.id and checked_in_at is not null) then
+    raise exception 'Este convidado já entrou no evento.';
+  end if;
+  perform public.release_order_seats(o.id);
+  update public.orders set status = 'canceled' where id = o.id;
+end $$;
+
 -- ---------- Validação na entrada ----------
 
 create or replace function public.check_in(p_code text, p_event uuid) returns jsonb
@@ -960,7 +1091,7 @@ create or replace view public.ticket_types_public with (security_barrier = true)
          (t.sold >= t.capacity)                         as sold_out
   from public.ticket_types t
   join public.events e on e.id = t.event_id
-  where e.published or public.can_manage_event(e.id) or public.is_event_staff(e.id);
+  where not t.hidden and (e.published or public.can_manage_event(e.id) or public.is_event_staff(e.id));
 drop policy if exists ticket_types_write on public.ticket_types;
 create policy ticket_types_write on public.ticket_types for all
   using (public.can_manage_event(event_id)) with check (public.can_manage_event(event_id));
@@ -1033,8 +1164,8 @@ grant update (default_fee_pct, default_platform_type, default_platform_pct, defa
               payments_enabled, reservation_minutes, pix_fee_fixed, pix_fee_pct, card_fee_fixed, card_fee_pct,
               split_fee_fixed, card_fee_pct_2_6, card_fee_pct_7_12)
   on public.settings to authenticated;
-grant insert (id, event_id, name, price, capacity, allows_half, sort, sales_start, sales_end, show_remaining),
-      update (name, price, capacity, allows_half, sort, sales_start, sales_end, show_remaining),
+grant insert (id, event_id, name, price, capacity, allows_half, sort, sales_start, sales_end, show_remaining, hidden),
+      update (name, price, capacity, allows_half, sort, sales_start, sales_end, show_remaining, hidden),
       delete on public.ticket_types to authenticated;
 grant select on public.orders, public.tickets to authenticated;
 grant select, insert, update, delete on public.expenses to authenticated;
@@ -1111,6 +1242,19 @@ revoke execute on function public.digest_rows(timestamptz, timestamptz) from pub
 grant execute on function public.digest_rows(timestamptz, timestamptz) to service_role;
 grant select on public.tickets to service_role;
 
+revoke execute on function public.guest_order(uuid, integer, text, text, uuid, uuid) from public, anon, authenticated;
+revoke execute on function public.issue_guest(uuid, text, text, integer) from public, anon;
+grant execute on function public.issue_guest(uuid, text, text, integer) to authenticated;
+revoke execute on function public.set_invite_link(uuid, boolean) from public, anon;
+grant execute on function public.set_invite_link(uuid, boolean) to authenticated;
+revoke execute on function public.invite_info(text) from public;
+grant execute on function public.invite_info(text) to anon, authenticated;
+revoke execute on function public.claim_invite(text, text) from public, anon;
+grant execute on function public.claim_invite(text, text) to authenticated;
+revoke execute on function public.guest_ticket(uuid) from public;
+grant execute on function public.guest_ticket(uuid) to anon, authenticated;
+revoke execute on function public.cancel_guest(uuid) from public, anon;
+grant execute on function public.cancel_guest(uuid) to authenticated;
 revoke execute on function public.check_in(text, uuid) from public, anon;
 grant execute on function public.check_in(text, uuid) to authenticated;
 revoke execute on function public.checkin_stats(uuid) from public, anon;
