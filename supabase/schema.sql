@@ -593,23 +593,6 @@ begin
   if v_event.starts_at < now() - interval '6 hours' then
     raise exception 'As vendas deste evento foram encerradas.';
   end if;
-  if v_online then
-    if coalesce(p_method, '') not in ('pix', 'card') then
-      raise exception 'Escolha a forma de pagamento: Pix ou cartão.';
-    end if;
-    if p_method = 'card' then
-      v_inst := coalesce(p_installments, 1);
-      if v_inst < 1 or v_inst > v_event.max_installments then
-        raise exception 'Este evento aceita no máximo % parcela(s) no cartão.', v_event.max_installments;
-      end if;
-    end if;
-    if v_event.organizer_id is not null then
-      select coalesce(payout_account, '') into v_wallet from public.organizers where id = v_event.organizer_id;
-      if v_wallet = '' then
-        raise exception 'Este evento ainda não está habilitado para pagamento online. Avise quem organiza.';
-      end if;
-    end if;
-  end if;
 
   -- Reservas vencidas deste evento voltam para a venda (e liberam usos de cupom)
   perform public.release_expired(p_event);
@@ -702,8 +685,9 @@ begin
 
   -- Taxa de serviço e cobrança da plataforma: sobre o preço cheio
   v_fee  := round(v_subtotal * v_event.fee_pct / 100, 2);
+  -- Ingressos gratuitos (preço zero) não pagam a cobrança fixa da plataforma
   v_comm := case when v_event.platform_fee_type = 'fixed'
-                 then round(v_n * v_event.platform_fee_fixed, 2)
+                 then round((select count(*) from public.tickets t where t.order_id = v_order and t.unit_price > 0) * v_event.platform_fee_fixed, 2)
                  else round(v_subtotal * v_event.platform_pct / 100, 2) end;
   if v_event.organizer_id is not null then
     v_split  := case when v_online then cfg.split_fee_fixed else 0 end;
@@ -713,6 +697,26 @@ begin
     v_orgamt := greatest(v_subtotal - v_discount - v_comm - v_split, 0);
   end if;
   v_charge := v_subtotal - v_discount + v_fee;   -- valor antes da taxa do meio de pagamento
+
+  -- Só pedidos com valor a pagar exigem forma de pagamento e conta de recebimento do organizador.
+  -- Inscrição gratuita é confirmada na hora, sem nenhuma cobrança.
+  if v_online and v_charge > 0 then
+    if coalesce(p_method, '') not in ('pix', 'card') then
+      raise exception 'Escolha a forma de pagamento: Pix ou cartão.';
+    end if;
+    if p_method = 'card' then
+      v_inst := coalesce(p_installments, 1);
+      if v_inst < 1 or v_inst > v_event.max_installments then
+        raise exception 'Este evento aceita no máximo % parcela(s) no cartão.', v_event.max_installments;
+      end if;
+    end if;
+    if v_event.organizer_id is not null then
+      select coalesce(payout_account, '') into v_wallet from public.organizers where id = v_event.organizer_id;
+      if v_wallet = '' then
+        raise exception 'Este evento ainda não está habilitado para pagamento online. Avise quem organiza.';
+      end if;
+    end if;
+  end if;
 
   if v_online and v_charge > 0 then
     v_payfee := public.payment_fee_for(v_charge, p_method, v_inst);
