@@ -1,5 +1,6 @@
 import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm';
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
+import * as CFG from './config.js';
 
 const $app = document.getElementById('app');
 const $nav = document.getElementById('nav');
@@ -889,6 +890,39 @@ async function vMyTickets() {
 }
 
 /* ================= login ================= */
+// Login com Google pelo botão oficial (Google Identity Services): a tela do Google mostra o
+// domínio do site. O token volta para o Supabase com signInWithIdToken. Se o botão não carregar,
+// aparece o botão comum (que passa pelo endereço do Supabase).
+let gsiLoad = null;
+const loadGsi = () => gsiLoad ||= new Promise((ok, fail) => {
+  if (window.google?.accounts?.id) return ok();
+  const s = document.createElement('script');
+  s.src = 'https://accounts.google.com/gsi/client'; s.async = true; s.onload = () => ok(); s.onerror = fail;
+  document.head.appendChild(s);
+  setTimeout(() => fail(new Error('timeout')), 8000);
+});
+async function googleButton() {
+  const box = document.getElementById('gsi-btn'), fb = document.getElementById('google-fallback');
+  if (!box || !CFG.GOOGLE_CLIENT_ID) return;
+  try {
+    await loadGsi();
+    // nonce: o Google recebe o hash; o Supabase recebe o valor original e confere
+    const raw = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(24))));
+    const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw)))].map(b => b.toString(16).padStart(2, '0')).join('');
+    google.accounts.id.initialize({
+      client_id: CFG.GOOGLE_CLIENT_ID, nonce: hash, ux_mode: 'popup', use_fedcm_for_button: true, context: 'signin',
+      callback: async resp => {
+        const { error } = await sb.auth.signInWithIdToken({ provider: 'google', token: resp.credential, nonce: raw });
+        if (error) toast(errMsg(error), 'bad');   // deu certo: onAuthStateChange leva para a página certa
+      }
+    });
+    if (!box.isConnected) return;
+    google.accounts.id.renderButton(box, { type: 'standard', theme: 'outline', size: 'large', text: 'continue_with', shape: 'rectangular', logo_alignment: 'center', locale: 'pt-BR', width: Math.min(400, Math.max(220, box.clientWidth || 320)) });
+  } catch (_) {
+    if (fb) fb.hidden = false;
+  }
+}
+
 const GOOGLE_G = `<svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.7 32.7 29.2 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.4-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.7 15.1 19 12 24 12c3.1 0 5.8 1.2 7.9 3.1l5.7-5.7C34 6.1 29.3 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.2 0-9.6-3.3-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.2-2.2 4.2-4.1 5.6l6.2 5.2C37 39.2 44 34 44 24c0-1.3-.1-2.4-.4-3.5z"/></svg>`;
 function vLogin(mode) {
   const tabs = [['entrar', 'Entrar'], ['criar-conta', 'Criar conta'], ['esqueci', 'Esqueci a senha']];
@@ -909,7 +943,8 @@ function vLogin(mode) {
         <p class="note">Abra o link no mesmo navegador em que você pediu.</p></form>`
   }[mode] || '';
   const google = mode === 'esqueci' ? '' : `
-    <button class="btn google" type="button" data-act="google">${GOOGLE_G} Continuar com o Google</button>
+    <div id="gsi-btn" class="gsi-btn" aria-live="polite"></div>
+    <button class="btn google" type="button" data-act="google" id="google-fallback" ${CFG.GOOGLE_CLIENT_ID ? 'hidden' : ''}>${GOOGLE_G} Continuar com o Google</button>
     <div class="or"><span>ou com e-mail e senha</span></div>`;
   mount(`<div class="panel narrow">
     <div><div class="eyebrow">Sua conta</div><h1 style="font-size:1.8rem">Acesse a Catraca</h1>
@@ -941,6 +976,7 @@ function vLogin(mode) {
       document.getElementById('auth-msg').innerHTML = `<div class="msg ok">Se existir uma conta com este e-mail, você vai receber um link para criar uma nova senha.</div>`;
     }
   });
+  if (mode !== 'esqueci') googleButton();
 }
 
 function vNewPassword() {
