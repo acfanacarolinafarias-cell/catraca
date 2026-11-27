@@ -561,8 +561,211 @@ async function vOrder(id) {
     <p class="note">Em nome de <b>${esc(o.buyer_name)}</b> · ${esc(o.events?.venue || '')} · Total ${money(o.total)}</p>
     ${passList(o.tickets)}
     <div class="row"><a class="btn" href="#/meus-ingressos">Ver todos os meus ingressos</a><a class="btn" href="#/evento/${esc(o.events?.id)}">Comprar mais</a></div>
-  </div>`);
+    ${shareBlock()}
+  </div>`, shareActions(o));
   drawQRs();
+}
+
+/* ================= cartão para compartilhar ================= */
+// Desenhado no próprio aparelho (canvas). Nunca leva QR Code nem código do ingresso.
+const SC = { blue: '#3346F0', deep: '#2433C7', ink: '#121A33', muted: '#59627E', stub: '#FFC23D', onStub: '#2A1F00', white: '#FFFFFF' };
+const SC_DISPLAY = '"Bricolage Grotesque", "Inter", system-ui, sans-serif';
+const SC_BODY = '"Inter", system-ui, sans-serif';
+
+async function scFonts() {
+  try { await Promise.all([`800 120px ${SC_DISPLAY}`, `600 40px ${SC_DISPLAY}`, `500 36px ${SC_BODY}`, `600 36px ${SC_BODY}`].map(f => document.fonts.load(f))); } catch (_) {}
+}
+// Quebra o texto em até maxLines linhas, diminuindo a fonte até caber
+function scFit(ctx, text, font, size, minSize, maxW, maxLines) {
+  for (let s = size; s >= minSize; s -= 4) {
+    ctx.font = font(s);
+    const words = String(text).split(/\s+/), lines = [];
+    let cur = '';
+    for (const w of words) {
+      const t = cur ? cur + ' ' + w : w;
+      if (ctx.measureText(t).width <= maxW || !cur) cur = t; else { lines.push(cur); cur = w; }
+    }
+    if (cur) lines.push(cur);
+    if (lines.length <= maxLines && lines.every(l => ctx.measureText(l).width <= maxW)) return { size: s, lines };
+  }
+  ctx.font = font(minSize);
+  let one = String(text);
+  while (one.length > 3 && ctx.measureText(one + '…').width > maxW) one = one.slice(0, -1);
+  return { size: minSize, lines: [one + '…'] };
+}
+// Bilhete com entalhes nas duas pontas da linha picotada (vertical ou horizontal)
+function scTicket(ctx, x, y, w, h, r, cut, notch, vertical) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  if (vertical) { ctx.lineTo(cut - notch, y); ctx.arc(cut, y, notch, Math.PI, 0, true); }
+  ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+  if (!vertical) { ctx.lineTo(x + w, cut - notch); ctx.arc(x + w, cut, notch, -Math.PI / 2, Math.PI / 2, true); }
+  ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  if (vertical) { ctx.lineTo(cut + notch, y + h); ctx.arc(cut, y + h, notch, 0, Math.PI, true); }
+  ctx.lineTo(x + r, y + h); ctx.arcTo(x, y + h, x, y + h - r, r);
+  if (!vertical) { ctx.lineTo(x, cut + notch); ctx.arc(x, cut, notch, Math.PI / 2, -Math.PI / 2, true); }
+  ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+function scLogo(ctx, x, y, s) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s / 24, s / 24);
+  ctx.fillStyle = SC.white; ctx.beginPath(); ctx.roundRect(0, 0, 24, 24, 6); ctx.fill();
+  ctx.strokeStyle = SC.blue; ctx.lineWidth = 2.2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.stroke(new Path2D('M4 7h16v3a2 2 0 0 0 0 4v3H4v-3a2 2 0 0 0 0-4z'));
+  ctx.setLineDash([2, 2.2]); ctx.stroke(new Path2D('M14 7v10'));
+  ctx.restore();
+}
+
+async function drawShareCard(o, format = 'square') {
+  await scFonts();
+  const story = format === 'story', W = 1080, H = story ? 1920 : 1080;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d');
+  const ev = o.events || {}, d = new Date(ev.starts_at);
+  const wd = d.toLocaleDateString('pt-BR', { weekday: 'short' }).replace('.', '').toUpperCase();
+  const day = d.toLocaleDateString('pt-BR', { day: '2-digit' });
+  const mon = d.toLocaleDateString('pt-BR', { month: 'short' }).replace('.', '').toUpperCase();
+  const hour = d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }).replace(':', 'h');
+  const first = String(o.buyer_name || '').trim().split(/\s+/)[0] || '';
+  const place = [ev.venue, ev.city].filter(Boolean).join(' · ');
+
+  // Fundo: azul com uma "catraca" girando em linhas finas
+  const g = ctx.createLinearGradient(0, 0, W, H); g.addColorStop(0, SC.blue); g.addColorStop(1, SC.deep);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.save(); ctx.translate(W * 0.92, story ? 330 : 150); ctx.strokeStyle = 'rgba(255,255,255,0.10)'; ctx.lineWidth = 18; ctx.lineCap = 'round';
+  for (let i = 0; i < 3; i++) { ctx.rotate(Math.PI * 2 / 3); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, story ? 420 : 300); ctx.stroke(); }
+  ctx.beginPath(); ctx.arc(0, 0, 40, 0, Math.PI * 2); ctx.fillStyle = 'rgba(255,255,255,0.10)'; ctx.fill();
+  ctx.restore();
+
+  const M = 72; // margem
+  // Marca
+  scLogo(ctx, M, story ? 120 : 64, 52);
+  ctx.fillStyle = SC.white; ctx.font = `700 38px ${SC_DISPLAY}`; ctx.textBaseline = 'middle';
+  ctx.fillText('Catraca', M + 68, (story ? 120 : 64) + 27);
+
+  // Título
+  ctx.textBaseline = 'alphabetic';
+  const hy = story ? 560 : 268, hs = story ? 176 : 148;
+  ctx.font = `800 ${hs}px ${SC_DISPLAY}`; ctx.fillStyle = SC.white;
+  const t1 = 'Tô dentro'; ctx.fillText(t1, M - 4, hy);
+  ctx.fillStyle = SC.stub; ctx.fillText('.', M - 4 + ctx.measureText(t1).width, hy);
+  ctx.fillStyle = 'rgba(255,255,255,0.82)'; ctx.font = `500 ${story ? 44 : 38}px ${SC_BODY}`;
+  ctx.fillText(first ? `${first} garantiu o ingresso para` : 'Ingresso garantido para', M, hy + (story ? 84 : 66));
+
+  // Bilhete
+  const tx = M, tw = W - 2 * M, ty = story ? 740 : 384, th = story ? 820 : 470;
+  const stubW = 262, cut = story ? ty + th - 250 : tx + tw - stubW;
+  ctx.save();
+  ctx.shadowColor = 'rgba(8,12,60,0.35)'; ctx.shadowBlur = 40; ctx.shadowOffsetY = 18;
+  scTicket(ctx, tx, ty, tw, th, 30, cut, 28, !story);
+  ctx.fillStyle = SC.white; ctx.fill();
+  ctx.restore();
+  // canhoto amarelo
+  ctx.save(); scTicket(ctx, tx, ty, tw, th, 30, cut, 28, !story); ctx.clip();
+  ctx.fillStyle = SC.stub;
+  if (story) ctx.fillRect(tx, cut, tw, ty + th - cut); else ctx.fillRect(cut, ty, tx + tw - cut, th);
+  ctx.restore();
+  // picote
+  ctx.save(); ctx.strokeStyle = 'rgba(42,31,0,0.35)'; ctx.lineWidth = 4; ctx.setLineDash([14, 12]);
+  ctx.beginPath(); if (story) { ctx.moveTo(tx + 40, cut); ctx.lineTo(tx + tw - 40, cut); } else { ctx.moveTo(cut, ty + 40); ctx.lineTo(cut, ty + th - 40); } ctx.stroke();
+  ctx.restore();
+
+  // Conteúdo do bilhete
+  const px = tx + 52, pw = (story ? tw : cut - tx) - 104;
+  ctx.fillStyle = SC.muted; ctx.font = `600 30px ${SC_BODY}`; ctx.fillText('EVENTO', px, ty + 82);
+  const fit = scFit(ctx, ev.name || 'Evento', s => `800 ${s}px ${SC_DISPLAY}`, story ? 96 : 76, 44, pw, story ? 4 : 3);
+  ctx.fillStyle = SC.ink; ctx.font = `800 ${fit.size}px ${SC_DISPLAY}`;
+  let ly = ty + 82 + fit.size * 1.12;
+  for (const l of fit.lines) { ctx.fillText(l, px, ly); ly += fit.size * 1.08; }
+  if (place) {
+    const pf = scFit(ctx, place, s => `500 ${s}px ${SC_BODY}`, 34, 26, pw, 2);
+    ctx.fillStyle = SC.muted; ctx.font = `500 ${pf.size}px ${SC_BODY}`;
+    ly = story ? Math.max(ly + 14, cut - 64 - (pf.lines.length - 1) * pf.size * 1.3) : ly + 14;
+    for (const l of pf.lines) { ctx.fillText(l, px, ly); ly += pf.size * 1.3; }
+  }
+  // Data no canhoto
+  ctx.fillStyle = SC.onStub; ctx.textAlign = 'center';
+  if (story) {
+    const cy = cut + (ty + th - cut) / 2;
+    ctx.font = `800 120px ${SC_DISPLAY}`; const dw = ctx.measureText(day).width;
+    ctx.font = `700 44px ${SC_DISPLAY}`; const side = Math.max(ctx.measureText(`${wd} · ${mon}`).width, ctx.measureText(hour).width);
+    const total = dw + 36 + side, sx = W / 2 - total / 2;
+    ctx.textAlign = 'left'; ctx.font = `800 120px ${SC_DISPLAY}`; ctx.fillText(day, sx, cy + 42);
+    ctx.font = `700 44px ${SC_DISPLAY}`; ctx.fillText(`${wd} · ${mon}`, sx + dw + 36, cy - 6);
+    ctx.font = `500 40px ${SC_BODY}`; ctx.fillText(hour, sx + dw + 36, cy + 46);
+  } else {
+    const cx = cut + (tx + tw - cut) / 2, cy = ty + th / 2;
+    ctx.font = `700 40px ${SC_DISPLAY}`; ctx.fillText(wd, cx, cy - 96);
+    ctx.font = `800 132px ${SC_DISPLAY}`; ctx.fillText(day, cx, cy + 34);
+    ctx.font = `700 40px ${SC_DISPLAY}`; ctx.fillText(mon, cx, cy + 90);
+    ctx.font = `500 36px ${SC_BODY}`; ctx.fillText(hour, cx, cy + 150);
+  }
+  ctx.textAlign = 'left';
+
+  // Rodapé
+  const fy = story ? 1720 : 980;
+  ctx.fillStyle = SC.white; ctx.font = `700 ${story ? 54 : 44}px ${SC_DISPLAY}`;
+  ctx.fillText('Vem também?', M, fy);
+  ctx.fillStyle = 'rgba(255,255,255,0.82)'; ctx.font = `500 ${story ? 38 : 32}px ${SC_BODY}`;
+  ctx.fillText('Ingressos na Catraca', M, fy + (story ? 58 : 48));
+  // seta
+  ctx.save(); ctx.translate(W - M - 44, fy - (story ? 8 : 4)); ctx.fillStyle = SC.stub;
+  ctx.beginPath(); ctx.arc(0, 0, story ? 48 : 40, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = SC.onStub; ctx.lineWidth = 7; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.beginPath(); ctx.moveTo(-16, 0); ctx.lineTo(16, 0); ctx.moveTo(4, -13); ctx.lineTo(17, 0); ctx.lineTo(4, 13); ctx.stroke();
+  ctx.restore();
+  return cv;
+}
+
+const canvasBlob = cv => new Promise(r => cv.toBlob(r, 'image/png'));
+function shareBlock() {
+  return `<div class="share-box">
+    <div><h3 style="margin:0">Conte para a galera</h3><p class="note" style="margin:4px 0 0">Um cartão para o status, stories ou grupo. Ele não mostra o QR Code: seus ingressos continuam só com você.</p></div>
+    <div class="subtabs" role="tablist"><a href="#" data-act="share-fmt" data-fmt="square" aria-current="page">Quadrado</a><a href="#" data-act="share-fmt" data-fmt="story">Stories</a></div>
+    <div class="share-prev"><img id="share-img" alt="Cartão para compartilhar"></div>
+    <div class="row" style="flex-wrap:wrap">
+      <button class="btn primary" type="button" data-act="share-native" id="share-native" hidden>Compartilhar</button>
+      <button class="btn" type="button" data-act="share-wa">WhatsApp</button>
+      <button class="btn" type="button" data-act="share-dl">Baixar imagem</button>
+    </div></div>`;
+}
+function shareActions(o) {
+  let fmt = 'square', cv = null;
+  const fname = () => `catraca-${(o.events?.name || 'evento').toLowerCase().normalize('NFD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40)}-${fmt}.png`;
+  const link = `${BASE_URL}#/evento/${o.events?.id}`;
+  const text = `Tô dentro! Vou no ${o.events?.name}. Vem também: ${link}`;
+  const render = async () => {
+    cv = await drawShareCard(o, fmt);
+    const img = document.getElementById('share-img'); if (img) { img.src = cv.toDataURL('image/png'); img.dataset.fmt = fmt; }
+    const file = new File([await canvasBlob(cv)], fname(), { type: 'image/png' });
+    const nb = document.getElementById('share-native');
+    if (nb) nb.hidden = !(navigator.canShare && navigator.canShare({ files: [file] }));
+  };
+  setTimeout(render, 0);
+  return {
+    'share-fmt': async b => {
+      fmt = b.dataset.fmt;
+      document.querySelectorAll('[data-act="share-fmt"]').forEach(a => { if (a === b) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
+      await render();
+    },
+    'share-native': async () => {
+      const file = new File([await canvasBlob(cv)], fname(), { type: 'image/png' });
+      try { await navigator.share({ files: [file], text }); }
+      catch (e) { if (e?.name !== 'AbortError') toast('Não deu para abrir o compartilhamento. Use “Baixar imagem”.', 'bad'); }
+    },
+    'share-wa': async () => {
+      // No celular, manda a imagem direto pelo menu de compartilhar; sem isso, abre o WhatsApp com o texto e o link
+      const file = new File([await canvasBlob(cv)], fname(), { type: 'image/png' });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try { await navigator.share({ files: [file], text }); return; } catch (e) { if (e?.name === 'AbortError') return; }
+      }
+      window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank', 'noopener');
+    },
+    'share-dl': async () => {
+      const a = document.createElement('a'); a.href = URL.createObjectURL(await canvasBlob(cv)); a.download = fname();
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    }
+  };
 }
 
 async function invokeFn(name, body) {
