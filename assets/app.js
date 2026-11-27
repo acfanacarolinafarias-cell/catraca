@@ -565,7 +565,7 @@ async function vOrder(id) {
     <p class="note">Em nome de <b>${esc(o.buyer_name)}</b> · ${esc(o.events?.venue || '')} · Total ${money(o.total)}</p>
     ${passList(o.tickets)}
     <div class="row"><a class="btn" href="#/meus-ingressos">Ver todos os meus ingressos</a><a class="btn" href="#/evento/${esc(o.events?.id)}">Comprar mais</a></div>
-    ${shareBlock()}
+    ${shareBlock(o)}
   </div>`, shareActions(o));
   drawQRs();
 }
@@ -722,22 +722,31 @@ async function drawShareCard(o, format = 'square') {
 }
 
 const canvasBlob = cv => new Promise(r => cv.toBlob(r, 'image/png'));
-function shareBlock() {
+function shareBlock(o) {
+  const link = `${BASE_URL}#/evento/${o.events?.id}`;
   return `<div class="share-box">
     <div><h3 style="margin:0">Conte para a galera</h3><p class="note" style="margin:4px 0 0">Um cartão para o status, stories ou grupo. Ele não mostra o QR Code: seus ingressos continuam só com você.</p></div>
     <div class="subtabs" role="tablist"><a href="#" data-act="share-fmt" data-fmt="square" aria-current="page">Quadrado</a><a href="#" data-act="share-fmt" data-fmt="story">Stories</a></div>
     <div class="share-prev"><img id="share-img" alt="Cartão para compartilhar"></div>
+    <div class="field"><label for="share-link">Link da página do evento (vai junto com o cartão)</label>
+      <div class="row"><input id="share-link" class="input mono" readonly value="${esc(link)}" style="flex:1;min-width:0" data-act="share-select"><button class="btn" type="button" data-act="share-copy">Copiar link</button></div></div>
     <div class="row" style="flex-wrap:wrap">
       <button class="btn primary" type="button" data-act="share-native" id="share-native" hidden>Compartilhar</button>
       <button class="btn" type="button" data-act="share-wa">WhatsApp</button>
       <button class="btn" type="button" data-act="share-dl">Baixar imagem</button>
-    </div></div>`;
+    </div>
+    <p class="note" style="margin:0">Nos stories do Instagram, o link não vai sozinho: use o adesivo <b>Link</b> e cole o link do evento. Ao baixar a imagem, o link já fica copiado.</p></div>`;
 }
 function shareActions(o) {
   let fmt = 'square', cv = null;
   const fname = () => `catraca-${(o.events?.name || 'evento').toLowerCase().normalize('NFD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40)}-${fmt}.png`;
   const link = `${BASE_URL}#/evento/${o.events?.id}`;
-  const text = `Tô dentro! Vou no ${o.events?.name}. Vem também: ${link}`;
+  const when = o.events?.starts_at ? new Date(o.events.starts_at).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) : '';
+  const text = `Tô dentro! Vou no ${o.events?.name}${when ? ' em ' + when : ''}. Garanta o seu: ${link}`;
+  const copyLink = async () => {
+    try { await navigator.clipboard.writeText(link); return true; }
+    catch (_) { const el = document.getElementById('share-link'); if (el) { el.select(); try { return document.execCommand('copy'); } catch (_) {} } return false; }
+  };
   const render = async () => {
     cv = await drawShareCard(o, fmt);
     const img = document.getElementById('share-img'); if (img) { img.src = cv.toDataURL('image/png'); img.dataset.fmt = fmt; }
@@ -754,20 +763,25 @@ function shareActions(o) {
     },
     'share-native': async () => {
       const file = new File([await canvasBlob(cv)], fname(), { type: 'image/png' });
-      try { await navigator.share({ files: [file], text }); }
+      await copyLink();   // se o app de destino ignorar o texto (ex.: stories), o link está copiado para colar
+      try { await navigator.share({ files: [file], text, title: o.events?.name || 'Catraca' }); }
       catch (e) { if (e?.name !== 'AbortError') toast('Não deu para abrir o compartilhamento. Use “Baixar imagem”.', 'bad'); }
     },
+    'share-copy': async () => { const ok = await copyLink(); toast(ok ? 'Link do evento copiado.' : 'Não deu para copiar. Selecione o link e copie.', ok ? 'ok' : 'bad'); },
+    'share-select': el => el.select(),
     'share-wa': async () => {
       // No celular, manda a imagem direto pelo menu de compartilhar; sem isso, abre o WhatsApp com o texto e o link
       const file = new File([await canvasBlob(cv)], fname(), { type: 'image/png' });
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        try { await navigator.share({ files: [file], text }); return; } catch (e) { if (e?.name === 'AbortError') return; }
+        await copyLink();
+        try { await navigator.share({ files: [file], text, title: o.events?.name || 'Catraca' }); return; } catch (e) { if (e?.name === 'AbortError') return; }
       }
       window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank', 'noopener');
     },
     'share-dl': async () => {
       const a = document.createElement('a'); a.href = URL.createObjectURL(await canvasBlob(cv)); a.download = fname();
       document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+      toast(await copyLink() ? 'Imagem baixada. O link do evento foi copiado: cole junto com a imagem.' : 'Imagem baixada. Copie o link do evento acima para mandar junto.');
     }
   };
 }
