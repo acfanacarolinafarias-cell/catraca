@@ -37,8 +37,8 @@ Quando o arquivo `supabase/schema.sql` mudar, rode-o inteiro de novo no **SQL Ed
 
 Em **Authentication → URL Configuration**:
 
-- **Site URL**: `https://acfanacarolinafarias-cell.github.io/catraca/`
-- **Redirect URLs**: adicione `https://acfanacarolinafarias-cell.github.io/catraca/**`
+- **Site URL**: `https://catraca.aefetech.com.br/`
+- **Redirect URLs**: adicione `https://catraca.aefetech.com.br/**` (e mantenha o endereço antigo `https://acfanacarolinafarias-cell.github.io/catraca/**`, que redireciona para o novo)
 
 Em **Authentication → Sign In / Providers → Email**, deixe **Confirm email** ligado. Isso impede que alguém crie uma conta com o e-mail de um organizador sem ter acesso a esse e-mail.
 
@@ -139,3 +139,7 @@ assets/style.css      visual (claro e escuro automáticos)
 assets/config.js      URL e chave pública do Supabase
 supabase/schema.sql   tabelas, regras de acesso e funções de compra/entrada
 ```
+
+## Domínio
+
+O site fica em **https://catraca.aefetech.com.br**. No Cloudflare (zona aefetech.com.br) há um registro `CNAME catraca → acfanacarolinafarias-cell.github.io`, em **DNS only** (sem o proxy laranja), para o GitHub emitir o certificado HTTPS. O arquivo `CNAME` na raiz do repositório diz ao GitHub Pages qual é o domínio. O endereço antigo `acfanacarolinafarias-cell.github.io/catraca` redireciona sozinho para o novo.

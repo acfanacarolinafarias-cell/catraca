@@ -1,7 +1,7 @@
 // Envio de e-mails pelo Resend (https://resend.com/docs/api-reference/emails/send-email).
 // Segredos: RESEND_API_KEY (obrigatório para enviar) e MAIL_FROM (opcional).
 const FROM = Deno.env.get('MAIL_FROM') || 'Catraca <catraca@aefetech.com.br>';
-export const SITE_URL = (Deno.env.get('SITE_URL') || 'https://acfanacarolinafarias-cell.github.io/catraca/').replace(/\/?$/, '/');
+export const SITE_URL = (Deno.env.get('SITE_URL') || 'https://catraca.aefetech.com.br/').replace(/\/?$/, '/');
 
 export type Mail = { to: string; subject: string; html: string; text: string };
 
