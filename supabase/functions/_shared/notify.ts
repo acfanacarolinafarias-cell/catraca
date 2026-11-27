@@ -30,7 +30,7 @@ async function buyerEmail(db: SupabaseClient, o: { buyer_email: string; buyer_id
 
 async function loadOrder(db: SupabaseClient, id: string) {
   const { data, error } = await db.from('orders')
-    .select('id, code, status, buyer_id, buyer_name, buyer_email, total, installments, payment_method, events(name, starts_at, venue, city), tickets(code, type_name, kind)')
+    .select('id, code, status, buyer_id, buyer_name, buyer_email, total, installments, payment_method, guest_token, issued_by, events(name, starts_at, venue, city), tickets(code, type_name, kind)')
     .eq('id', id).single();
   if (error) throw error;
   return data as any;
@@ -38,7 +38,8 @@ async function loadOrder(db: SupabaseClient, id: string) {
 
 function confirmationMail(o: any) {
   const ev = o.events || {};
-  const link = `${SITE_URL}#/pedido/${o.id}`;
+  // Convite emitido pelo organizador: link próprio, que abre os QR Codes sem precisar de conta
+  const link = o.guest_token && o.issued_by ? `${SITE_URL}#/ingresso/${o.guest_token}` : `${SITE_URL}#/pedido/${o.id}`;
   const tks = (o.tickets || []).sort((a: any, b: any) => String(a.code).localeCompare(b.code, 'pt-BR', { numeric: true }));
   const list = tks.map((t: any) => `<tr><td style="padding:6px 0;font-family:monospace">${esc(t.code)}</td><td style="padding:6px 0">${esc(t.type_name)}${t.kind === 'meia' ? ' · meia-entrada' : ''}</td></tr>`).join('');
   const parc = o.payment_method === 'card' && o.installments > 1 ? ` (em ${o.installments}× no cartão)` : '';
@@ -67,7 +68,8 @@ ${Number(o.total) > 0 ? `Total pago: ${money(o.total)}${parc}` : 'Evento gratuit
 Ver meus ingressos com QR Code: ${link}
 
 Na entrada, mostre o QR Code de cada ingresso. ${Number(o.total) > 0 ? 'Cancelamento: devolução integral em até 7 dias da compra; depois, desconta as taxas. Pedidos até 48 horas antes do evento.' : 'Não vai poder ir? Avise a organização para liberar a vaga.'} Mais em ${SITE_URL}#/ajuda`;
-  return { subject: `${Number(o.total) > 0 ? 'Seus ingressos' : 'Inscrição confirmada'} para ${ev.name} · pedido ${o.code}`, html, text };
+  const what = o.guest_token ? 'Seu convite' : Number(o.total) > 0 ? 'Seus ingressos' : 'Inscrição confirmada';
+  return { subject: `${what} para ${ev.name} · pedido ${o.code}`, html, text };
 }
 
 function refundMail(o: any) {
