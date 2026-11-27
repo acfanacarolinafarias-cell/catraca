@@ -229,3 +229,5 @@ ol.steps li { margin: 6px 0; }
 .share-prev { display: flex; justify-content: center; }
 .share-prev img { width: 100%; max-width: 340px; border-radius: 12px; box-shadow: 0 8px 24px rgba(10, 16, 60, 0.18); background: var(--surface-2); aspect-ratio: 1; }
 .share-prev img[data-fmt="story"] { max-width: 220px; aspect-ratio: 9 / 16; }
+.gsi-btn { display: flex; justify-content: center; min-height: 44px; }
+.gsi-btn:empty { min-height: 0; }
