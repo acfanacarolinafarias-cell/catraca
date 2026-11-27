@@ -488,7 +488,8 @@ function vHelp() {
   mount(`<div class="page-head"><div><div class="eyebrow">Ajuda</div><h1>Dúvidas frequentes</h1>
       <p>Compras, pagamentos, cancelamentos e ingressos.</p></div></div>
     <div class="panel medium" style="width:100%">${FAQ.map(([q, a]) => `<details><summary><b>${esc(q)}</b></summary><p>${esc(a)}</p></details>`).join('')}</div>
-    <p style="margin-top:16px"><a class="btn" href="#/app">📱 Instalar o app no celular</a></p>`);
+    <p style="margin-top:16px"><a class="btn" href="#/app">📱 Instalar o app no celular</a></p>
+    <p class="note"><a href="termos.html">Termos de uso</a> · <a href="privacidade.html">Política de privacidade</a></p>`);
 }
 
 /* ================= instalar como app ================= */
@@ -697,6 +698,7 @@ function vLogin(mode) {
     <div id="auth-msg"></div>
     ${google}
     ${body}
+    <p class="note">Ao entrar ou criar uma conta, você concorda com os <a href="termos.html" target="_blank">Termos de uso</a> e a <a href="privacidade.html" target="_blank">Política de privacidade</a>.</p>
   </div>`, {
     google: async b => {
       b.disabled = true;
