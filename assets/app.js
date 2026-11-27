@@ -1112,7 +1112,9 @@ async function mInfo(ev, header, reload, admin) {
       <div class="field full"><label for="e-desc">Descrição</label><textarea id="e-desc" name="description" rows="5">${esc(ev.description)}</textarea></div>
       ${admin ? `
       <div class="field"><label for="e-org">Organizador responsável</label><select id="e-org" name="organizer_id"><option value="">Sem organizador</option>${orgs.map(o => `<option value="${esc(o.id)}" ${o.id === ev.organizer_id ? 'selected' : ''}>${esc(orgName(o))} (${o.person_type})</option>`).join('')}</select></div>
-      ${chargeFields({ type: ev.platform_fee_type, pct: ev.platform_pct, fixed: ev.platform_fee_fixed }, 'e')}`
+      ${chargeFields({ type: ev.platform_fee_type, pct: ev.platform_pct, fixed: ev.platform_fee_fixed }, 'e')}
+      <label class="check full"><input type="checkbox" name="free_only" ${ev.free_only ? 'checked' : ''}> <span><b>Evento gratuito (liberado pela administração)</b>: sem taxa de serviço e sem comissão. Só aceita lotes gratuitos.</span></label>`
+      : ev.free_only ? `<p class="note full">Evento gratuito liberado pela administração: sem taxa de serviço e sem comissão. Todos os lotes são gratuitos.</p>`
       : `<p class="note full">Cobranças definidas pela plataforma: taxa de serviço de ${num(ev.fee_pct)}% paga pelo comprador e ${esc(fmtCharge(ev))}. Só a administração altera.</p>`}
       <label class="check full"><input type="checkbox" name="published" ${ev.published ? 'checked' : ''}> Publicado: aparece na vitrine e aceita compras</label>
     </div>
@@ -1131,7 +1133,7 @@ async function mInfo(ev, header, reload, admin) {
       const starts = fromLocalInput(fd.get('starts_at'));
       if (!starts) return toast('Informe a data e a hora.', 'bad');
       const body = { name: String(fd.get('name')).trim(), starts_at: starts, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), description: String(fd.get('description')).trim(), published: fd.get('published') === 'on', max_installments: readInst(fd) };
-      if (admin) Object.assign(body, { organizer_id: fd.get('organizer_id') || null, fee_pct: Number(fd.get('fee_pct')) || 0 }, readCharge(fd));
+      if (admin) Object.assign(body, { organizer_id: fd.get('organizer_id') || null, fee_pct: Number(fd.get('fee_pct')) || 0, free_only: fd.get('free_only') === 'on' }, readCharge(fd));
       if (body.published && !(ev.ticket_types || []).length) toast('Lembre de cadastrar os lotes na aba “Lotes”.');
       must(await sb.from('events').update(body).eq('id', ev.id));
       toast('Informações salvas.'); reload();
@@ -1148,12 +1150,17 @@ function mLotes(ev, header, reload) {
     <div class="field"><label for="${p}-end">Fim das vendas (opcional)</label><input id="${p}-end" name="sales_end" type="datetime-local" value="${esc(toLocalInput(t?.sales_end))}"></div>
     <label class="check" style="grid-column:span 3;padding-bottom:9px"><input type="checkbox" name="show_remaining" ${t?.show_remaining ? 'checked' : ''}> Mostrar ao comprador quantos ingressos restam</label>
   </div>`;
+  const free = !!ev.free_only;
+  const priceField = (id, v) => free
+    ? `<div class="field"><span class="label">Preço</span><input type="hidden" name="price" value="0"><div class="input" style="background:var(--surface-2)">Grátis</div></div>`
+    : `<div class="field"><label for="${id}">Preço inteira (R$)</label><input id="${id}" name="price" type="number" min="0" step="0.01" required value="${esc(v ?? '')}"></div>`;
+  const halfField = (on) => free ? '<span></span>' : `<label class="check" style="padding-bottom:9px"><input type="checkbox" name="allows_half" ${on ? 'checked' : ''}> Meia</label>`;
   const row = (t, i) => `<form class="lotbox" data-form="type" data-id="${esc(t.id)}">
     <div class="typerow">
     <div class="field"><label for="t-name-${i}">Nome do lote / setor <span class="note">(${stLabel[lotState(t)]})</span></label><input id="t-name-${i}" name="name" required value="${esc(t.name)}"></div>
-    <div class="field"><label for="t-price-${i}">Preço inteira (R$)</label><input id="t-price-${i}" name="price" type="number" min="0" step="0.01" required value="${esc(t.price)}"></div>
+    ${priceField('t-price-' + i, t.price)}
     <div class="field"><label for="t-cap-${i}">Quantidade (vendidos: ${num(t.sold)})</label><input id="t-cap-${i}" name="capacity" type="number" min="${t.sold}" step="1" required value="${esc(t.capacity)}"></div>
-    <label class="check" style="padding-bottom:9px"><input type="checkbox" name="allows_half" ${t.allows_half ? 'checked' : ''}> Meia</label>
+    ${halfField(t.allows_half)}
     <div class="row" style="padding-bottom:2px"><button class="btn small" type="submit">Salvar</button>${t.sold ? '' : `<button class="btn small danger" type="button" data-act="del" data-id="${esc(t.id)}" aria-label="Excluir lote">Excluir</button>`}</div>
     </div>${extra(t, 't' + i)}
   </form>`;
@@ -1164,15 +1171,15 @@ function mLotes(ev, header, reload) {
              allows_half: fd.get('allows_half') === 'on', sales_start: start, sales_end: end, show_remaining: fd.get('show_remaining') === 'on' };
   };
   mount(header + `<div class="panel">
-    <div><h2>Lotes e setores</h2><p class="note">A meia-entrada custa metade da inteira e usa a mesma quantidade do lote. Cada lote para de vender no que vier primeiro: acabar a quantidade ou passar o fim do período. Por padrão, o comprador não vê quantos ingressos restam. Lotes com vendas não podem ser excluídos; diminua a quantidade até o total vendido para encerrar.</p></div>
+    <div><h2>Lotes e setores</h2>${free ? '<div class="msg ok" style="margin:8px 0">Evento gratuito: todos os lotes são grátis. Defina só o nome, a quantidade de vagas e, se quiser, o período de inscrição.</div>' : ''}<p class="note">A meia-entrada custa metade da inteira e usa a mesma quantidade do lote. Cada lote para de vender no que vier primeiro: acabar a quantidade ou passar o fim do período. Por padrão, o comprador não vê quantos ingressos restam. Lotes com vendas não podem ser excluídos; diminua a quantidade até o total vendido para encerrar.</p></div>
     <div>${types.length ? types.map(row).join('') : '<p class="note">Nenhum lote ainda.</p>'}</div>
   </div>
   <form class="panel" data-form="new"><h2>Novo lote</h2>
     <div class="typerow" style="border:0;padding:0">
       <div class="field"><label for="nt-name">Nome</label><input id="nt-name" name="name" required placeholder="Pista · 1º lote"></div>
-      <div class="field"><label for="nt-price">Preço inteira (R$)</label><input id="nt-price" name="price" type="number" min="0" step="0.01" required></div>
+      ${priceField('nt-price', '')}
       <div class="field"><label for="nt-cap">Quantidade</label><input id="nt-cap" name="capacity" type="number" min="1" step="1" required></div>
-      <label class="check" style="padding-bottom:9px"><input type="checkbox" name="allows_half" checked> Meia</label>
+      ${halfField(true)}
       <div style="padding-bottom:2px"><button class="btn primary small" type="submit">Adicionar</button></div>
     </div>
     ${extra(null, 'nt')}
@@ -1597,7 +1604,7 @@ async function vAdmin(tab) {
           <td class="num"><a class="btn small" href="#/admin/organizador/${esc(o.id)}">Abrir</a></td></tr>`).join('')}</tbody></table></div>`
         : '<p class="note">Cadastre o primeiro organizador para poder vincular eventos.</p>'}</div>`);
   }
-  const evs = must(await sb.from('events').select('id,name,starts_at,published,organizer_id,platform_pct,platform_fee_type,platform_fee_fixed,ticket_types(capacity,sold)').order('starts_at', { ascending: false }));
+  const evs = must(await sb.from('events').select('id,name,starts_at,published,organizer_id,free_only,platform_pct,platform_fee_type,platform_fee_fixed,ticket_types(capacity,sold)').order('starts_at', { ascending: false }));
   const totalSold = evs.reduce((a, e) => a + (e.ticket_types || []).reduce((b, t) => b + t.sold, 0), 0);
   const refunds = must(await sb.from('orders').select('id,code,buyer_name,buyer_email,total,paid_at,events(name)').eq('status', 'refund_needed').order('paid_at'));
   const refundPanel = refunds.length ? `<div class="panel" style="border-color:var(--bad)"><h2>${num(refunds.length)} pagamento${refunds.length > 1 ? 's' : ''} para devolver</h2>
@@ -1624,6 +1631,7 @@ async function vAdmin(tab) {
       ${instField(1, 'n')}
       <div class="field"><label for="n-fee">Taxa de serviço paga pelo comprador (%)</label><input id="n-fee" name="fee_pct" type="number" min="0" max="30" step="0.5" value="${esc(cfg.default_fee_pct)}"></div>
       ${chargeFields({ type: cfg.default_platform_type, pct: cfg.default_platform_pct, fixed: cfg.default_platform_fixed }, 'n')}
+      <label class="check full"><input type="checkbox" name="free_only" > <span><b>Evento gratuito (liberado pela administração)</b>: sem taxa de serviço e sem comissão. Só aceita lotes gratuitos.</span></label>
       <div class="full row"><button class="btn primary" type="submit">Criar e configurar lotes</button><span class="note">O evento nasce como rascunho. Publique depois de cadastrar os lotes.</span></div>
     </form>
   </details>
@@ -1632,7 +1640,7 @@ async function vAdmin(tab) {
       ${evs.map(e => { const cap = (e.ticket_types || []).reduce((a, t) => a + t.capacity, 0), sold = (e.ticket_types || []).reduce((a, t) => a + t.sold, 0); return `<tr>
         <td><b>${esc(e.name)}</b></td><td>${esc(fmtShort(e.starts_at))}</td>
         <td><select class="input" style="min-width:180px" data-change="link" data-id="${esc(e.id)}" aria-label="Organizador de ${esc(e.name)}">${orgOptions(e.organizer_id)}</select></td>
-        <td style="white-space:nowrap">${e.platform_fee_type === 'fixed' ? `${money(e.platform_fee_fixed)}/ingr.` : `${num(e.platform_pct)}%`}</td>
+        <td style="white-space:nowrap">${e.free_only ? '<span class="chip ok">Gratuito</span>' : e.platform_fee_type === 'fixed' ? `${money(e.platform_fee_fixed)}/ingr.` : `${num(e.platform_pct)}%`}</td>
         <td>${isPast(e) ? '<span class="chip">Encerrado</span>' : e.published ? '<span class="chip ok">Publicado</span>' : '<span class="chip">Rascunho</span>'}</td>
         <td class="num">${num(sold)}/${num(cap)}</td><td class="num"><a class="btn small" href="#/painel/evento/${esc(e.id)}/info">Gerenciar</a></td></tr>`; }).join('')}
     </tbody></table></div>` : '<p class="note">Nenhum evento ainda.</p>'}
@@ -1648,7 +1656,7 @@ async function vAdmin(tab) {
     new: async fd => {
       const starts = fromLocalInput(fd.get('starts_at'));
       if (!starts) return toast('Informe a data e a hora.', 'bad');
-      const ev = must(await sb.from('events').insert({ name: String(fd.get('name')).trim(), starts_at: starts, organizer_id: fd.get('organizer_id') || null, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), fee_pct: Number(fd.get('fee_pct')) || 0, max_installments: readInst(fd), ...readCharge(fd) }).select('id').single());
+      const ev = must(await sb.from('events').insert({ name: String(fd.get('name')).trim(), starts_at: starts, organizer_id: fd.get('organizer_id') || null, venue: String(fd.get('venue')).trim(), city: String(fd.get('city')).trim(), fee_pct: Number(fd.get('fee_pct')) || 0, max_installments: readInst(fd), ...readCharge(fd), free_only: fd.get('free_only') === 'on' }).select('id').single());
       toast('Evento criado. Agora cadastre os lotes.'); go(`#/painel/evento/${ev.id}/lotes`);
     }
   });

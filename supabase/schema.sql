@@ -319,7 +319,11 @@ begin
     new.platform_fee_type  := coalesce(cfg.default_platform_type, 'percent');
     new.platform_pct       := coalesce(cfg.default_platform_pct, 0);
     new.platform_fee_fixed := coalesce(cfg.default_platform_fixed, 0);
+    new.free_only          := false;
     return new;
+  end if;
+  if new.free_only is distinct from old.free_only then
+    raise exception 'Somente a administração libera um evento como gratuito.';
   end if;
   if new.organizer_id is distinct from old.organizer_id
      or new.platform_pct is distinct from old.platform_pct
@@ -376,6 +380,37 @@ drop trigger if exists events_staff_cleanup on public.events;
 create trigger events_staff_cleanup after update on public.events
   for each row execute function public.events_staff_cleanup();
 
+-- Evento gratuito: zera as cobranças e não aceita lotes pagos (vale para todos, inclusive a administração)
+create or replace function public.events_free_only() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if new.free_only then
+    if tg_op = 'UPDATE' and exists (select 1 from public.ticket_types where event_id = new.id and price > 0) then
+      raise exception 'Este evento tem lotes pagos. Deixe todos os lotes a R$ 0 antes de liberar como gratuito.';
+    end if;
+    new.fee_pct := 0; new.platform_fee_type := 'percent'; new.platform_pct := 0; new.platform_fee_fixed := 0;
+  end if;
+  return new;
+end $$;
+drop trigger if exists events_free_only on public.events;
+create trigger events_free_only before insert or update on public.events
+  for each row execute function public.events_free_only();
+
+create or replace function public.ticket_types_free_only() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if exists (select 1 from public.events where id = new.event_id and free_only) then
+    if new.price > 0 then
+      raise exception 'Este evento é gratuito: os lotes não podem ter preço.';
+    end if;
+    new.allows_half := false;   -- meia-entrada não se aplica a ingresso gratuito
+  end if;
+  return new;
+end $$;
+drop trigger if exists ticket_types_free_only on public.ticket_types;
+create trigger ticket_types_free_only before insert or update on public.ticket_types
+  for each row execute function public.ticket_types_free_only();
+
 -- ---------- Pagamento online: colunas ----------
 
 -- Configurações de pagamento (só a administração altera)
@@ -394,6 +429,9 @@ do $$ begin
   alter table public.settings add constraint settings_installment_fees_check check (
     card_fee_pct_2_6 between 0 and 50 and card_fee_pct_7_12 between 0 and 50);
 exception when duplicate_object then null; end $$;
+
+-- Evento gratuito liberado pela administração: sem taxa nem comissão, e só aceita lotes gratuitos
+alter table public.events add column if not exists free_only boolean not null default false;
 
 -- Parcelamento máximo no cartão, definido pelo organizador em cada evento (1 = só à vista)
 alter table public.events add column if not exists max_installments integer not null default 1;
