@@ -12,3 +12,7 @@ verify_jwt = false
 # Vence reservas e cancela cobranças abertas; chamada pelo agendamento do banco (supabase/cron.sql).
 [functions.expire-orders]
 verify_jwt = false
+
+# E-mails aos compradores e resumo diário aos organizadores; chamada pelo agendamento do banco (supabase/cron.sql).
+[functions.notify]
+verify_jwt = false

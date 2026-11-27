@@ -1020,6 +1020,55 @@ grant execute on function public.fail_payment(text, text, text) to service_role;
 grant select, update on public.orders to service_role;
 grant select on public.events, public.organizers, public.settings to service_role;
 grant execute on function public.release_expired(uuid) to service_role;
+
+-- ---------- Notificações por e-mail (função "notify") ----------
+-- Quando o e-mail de confirmação / devolução foi enviado ao comprador
+-- Na primeira vez, os pedidos que já existiam ficam marcados como avisados (não recebem e-mail atrasado)
+do $$ begin
+  if not exists (select 1 from information_schema.columns
+                 where table_schema = 'public' and table_name = 'orders' and column_name = 'confirmation_email_at') then
+    alter table public.orders add column confirmation_email_at timestamptz;
+    alter table public.orders add column if not exists refund_email_at timestamptz;
+    update public.orders set confirmation_email_at = now() where status = 'confirmed';
+    update public.orders set refund_email_at = now()       where status = 'refunded';
+  end if;
+end $$;
+alter table public.orders add column if not exists refund_email_at timestamptz;
+create index if not exists orders_mail_pending_idx on public.orders (status)
+  where confirmation_email_at is null or refund_email_at is null;
+
+-- Resumos diários já enviados aos organizadores (um por organizador e dia)
+create table if not exists public.organizer_digests (
+  organizer_id uuid not null references public.organizers(id) on delete cascade,
+  day          date not null,
+  sent_at      timestamptz not null default now(),
+  primary key (organizer_id, day)
+);
+alter table public.organizer_digests enable row level security;   -- sem políticas: só o servidor acessa
+revoke all on public.organizer_digests from public, anon, authenticated;
+grant select, insert, delete on public.organizer_digests to service_role;
+
+-- Vendas confirmadas no intervalo, por organizador e evento
+create or replace function public.digest_rows(p_from timestamptz, p_to timestamptz)
+returns table (organizer_id uuid, organizer_name text, organizer_email text, event_name text,
+               orders integer, tickets integer, sales numeric, organizer_amount numeric)
+language sql stable security definer set search_path = public as $$
+  select g.id, coalesce(nullif(g.trade_name, ''), g.legal_name), g.email, e.name,
+         count(*)::int,
+         coalesce(sum((select count(*) from public.tickets t where t.order_id = o.id)), 0)::int,
+         sum(o.subtotal - o.discount), sum(o.organizer_amount)
+  from public.orders o
+  join public.events e on e.id = o.event_id
+  join public.organizers g on g.id = e.organizer_id
+  where o.status = 'confirmed'
+    and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+  group by g.id, g.trade_name, g.legal_name, g.email, e.id, e.name, e.starts_at
+  order by g.id, e.starts_at
+$$;
+revoke execute on function public.digest_rows(timestamptz, timestamptz) from public, anon, authenticated;
+grant execute on function public.digest_rows(timestamptz, timestamptz) to service_role;
+grant select on public.tickets to service_role;
+
 revoke execute on function public.check_in(text, uuid) from public, anon;
 grant execute on function public.check_in(text, uuid) to authenticated;
 revoke execute on function public.checkin_stats(uuid) from public, anon;
