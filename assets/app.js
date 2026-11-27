@@ -241,13 +241,32 @@ function vSetup() {
 }
 
 /* ================= vitrine ================= */
-const EV_PUBLIC = 'id,name,starts_at,venue,city,description,fee_pct,max_installments,published,ticket_types(id,name,price,capacity,allows_half,sort,sold)';
+// Público lê os lotes pela visão ticket_types_public (quantidade só aparece se o organizador escolheu mostrar)
+const LOT_FIELDS = 'id,name,price,capacity,allows_half,sort,sold,sales_start,sales_end,show_remaining';
+const EV_PUBLIC = `id,name,starts_at,venue,city,description,fee_pct,max_installments,published,ticket_types:ticket_types_public(${LOT_FIELDS},sold_out)`;
+const EV_OWNER = `id,name,starts_at,venue,city,description,fee_pct,max_installments,published,ticket_types(${LOT_FIELDS})`;
+// Situação de venda de um lote agora: 'soon' (ainda não começou), 'ended' (período acabou), 'soldout' ou 'on'
+const lotState = t => {
+  const now = Date.now();
+  if (t.sold_out || (t.capacity != null && t.sold != null && t.sold >= t.capacity)) return 'soldout';
+  if (t.sales_start && now < new Date(t.sales_start).getTime()) return 'soon';
+  if (t.sales_end && now > new Date(t.sales_end).getTime()) return 'ended';
+  return 'on';
+};
+const fmtDT = iso => new Date(iso).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).replace(',', ' às');
+// datetime-local (hora local do navegador) <-> ISO
+const toLocalInput = iso => { if (!iso) return ''; const d = new Date(iso); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
+const fromLocalInput = v => v ? new Date(v).toISOString() : null;
 
 function evStats(ev) {
   const ts = ev.ticket_types || [];
-  const cap = ts.reduce((a, t) => a + t.capacity, 0), sold = ts.reduce((a, t) => a + t.sold, 0);
-  const prices = ts.map(t => t.allows_half ? half(t.price) : Number(t.price));
-  return { cap, sold, left: Math.max(0, cap - sold), pct: cap ? Math.min(100, Math.round(sold / cap * 100)) : 0, min: prices.length ? Math.min(...prices) : 0 };
+  // Quantidades só entram na conta se todos os lotes mostram (ou se quem vê é o organizador)
+  const known = ts.length > 0 && ts.every(t => t.capacity != null && t.sold != null);
+  const cap = known ? ts.reduce((a, t) => a + t.capacity, 0) : 0, sold = known ? ts.reduce((a, t) => a + t.sold, 0) : 0;
+  const open = ts.filter(t => lotState(t) === 'on');
+  const prices = (open.length ? open : ts).map(t => t.allows_half ? half(t.price) : Number(t.price));
+  const soldOut = ts.length > 0 && ts.every(t => lotState(t) === 'soldout');
+  return { known, cap, sold, left: Math.max(0, cap - sold), pct: cap ? Math.min(100, Math.round(sold / cap * 100)) : 0, min: prices.length ? Math.min(...prices) : 0, soldOut };
 }
 
 function ticketCard(ev, href) {
@@ -255,8 +274,8 @@ function ticketCard(ev, href) {
   const chips = [];
   if (!ev.published) chips.push('<span class="chip">Rascunho</span>');
   if (isPast(ev)) chips.push('<span class="chip">Encerrado</span>');
-  else if (s.cap && s.left === 0) chips.push('<span class="chip bad">Esgotado</span>');
-  else if (s.pct >= 80) chips.push('<span class="chip bad">Últimos ingressos</span>');
+  else if (s.soldOut || (s.cap && s.left === 0)) chips.push('<span class="chip bad">Esgotado</span>');
+  else if (s.known && s.pct >= 80) chips.push('<span class="chip bad">Últimos ingressos</span>');
   if ((ev.ticket_types || []).some(t => t.allows_half)) chips.push('<span class="chip">Meia-entrada</span>');
   return `<a class="ticket" href="${href}">
     <div class="stub">
@@ -271,10 +290,10 @@ function ticketCard(ev, href) {
       <div class="meta">${esc(ev.venue)}${ev.city ? ' · ' + esc(ev.city) : ''}</div>
       <div class="tfoot">
         <div class="from">a partir de<strong>${money(s.min)}</strong></div>
-        <div style="display:grid;gap:4px;flex:1;max-width:180px">
+        ${s.known ? `<div style="display:grid;gap:4px;flex:1;max-width:180px">
           <div class="bar ${s.pct >= 80 ? 'hot' : ''}"><i style="width:${s.pct}%"></i></div>
           <div class="cap">${num(s.left)} de ${num(s.cap)} disponíveis</div>
-        </div>
+        </div>` : ''}
       </div>
     </div>
   </a>`;
@@ -337,12 +356,17 @@ async function vEvent(id) {
 
   const drawLots = () => {
     document.getElementById('lots').innerHTML = types.length ? types.map(t => {
-      const left = Math.max(0, t.capacity - t.sold);
+      const st = lotState(t);
+      const left = t.capacity != null && t.sold != null ? Math.max(0, t.capacity - t.sold) : null;
+      const status = st === 'soldout' ? ' · <span style="color:var(--bad)">esgotado</span>'
+        : st === 'soon' ? ` · vendas a partir de ${esc(fmtDT(t.sales_start))}`
+        : st === 'ended' ? ' · vendas encerradas'
+        : (left != null ? ` · restam ${num(left)}` : '') + (t.sales_end ? ` · até ${esc(fmtDT(t.sales_end))}` : '');
       return [['inteira', Number(t.price)], ...(t.allows_half ? [['meia', half(t.price)]] : [])].map(([kind, price]) => {
         const k = t.id + '|' + kind, q = cart[k] || 0;
-        const full = inCart(t.id) >= Math.min(left, 10);
+        const full = st !== 'on' || inCart(t.id) >= Math.min(left ?? 10, 10);
         return `<div class="lot"><div><div class="name">${esc(t.name)}${kind === 'meia' ? ' · Meia-entrada' : ''}</div>
-          <div class="price">${money(price)}${left === 0 ? ' · <span style="color:var(--bad)">esgotado</span>' : left <= 20 ? ` · restam ${num(left)}` : ''}</div></div>
+          <div class="price">${money(price)}${status}</div></div>
           ${past ? '' : `<div class="stepper"><button data-act="dec" data-k="${esc(k)}" ${q ? '' : 'disabled'} aria-label="Remover um">−</button><span>${q}</span><button data-act="inc" data-k="${esc(k)}" ${full ? 'disabled' : ''} aria-label="Adicionar um">+</button></div>`}</div>`;
       }).join('');
     }).join('') : '<p class="note">Os lotes ainda não foram cadastrados.</p>';
@@ -669,7 +693,7 @@ async function vPanel() {
     return vMessage('Nenhum evento vinculado', 'Quando a administração vincular um evento ao seu e-mail, ele aparece aqui.');
   }
   const [evs, cfg] = await Promise.all([
-    sb.from('events').select(EV_PUBLIC + ',organizer_id').in('organizer_id', ids).order('starts_at', { ascending: false }).then(must),
+    sb.from('events').select(EV_OWNER + ',organizer_id').in('organizer_id', ids).order('starts_at', { ascending: false }).then(must),
     getSettings()
   ]);
   const charge = fmtCharge({ platform_fee_type: cfg.default_platform_type, platform_pct: cfg.default_platform_pct, platform_fee_fixed: cfg.default_platform_fixed });
@@ -804,16 +828,30 @@ async function mInfo(ev, header, reload, admin) {
 
 function mLotes(ev, header, reload) {
   const types = sortTypes(ev.ticket_types);
-  const row = (t, i) => `<form class="typerow" data-form="type" data-id="${esc(t.id)}">
-    <div class="field"><label for="t-name-${i}">Nome do lote / setor</label><input id="t-name-${i}" name="name" required value="${esc(t.name)}"></div>
+  const stLabel = { on: 'à venda', soon: 'ainda não começou', ended: 'período encerrado', soldout: 'esgotado' };
+  // Segunda linha do lote: período de vendas e se o comprador vê a quantidade
+  const extra = (t, p) => `<div class="typerow lotextra">
+    <div class="field"><label for="${p}-start">Início das vendas (opcional)</label><input id="${p}-start" name="sales_start" type="datetime-local" value="${esc(toLocalInput(t?.sales_start))}"></div>
+    <div class="field"><label for="${p}-end">Fim das vendas (opcional)</label><input id="${p}-end" name="sales_end" type="datetime-local" value="${esc(toLocalInput(t?.sales_end))}"></div>
+    <label class="check" style="grid-column:span 3;padding-bottom:9px"><input type="checkbox" name="show_remaining" ${t?.show_remaining ? 'checked' : ''}> Mostrar ao comprador quantos ingressos restam</label>
+  </div>`;
+  const row = (t, i) => `<form class="lotbox" data-form="type" data-id="${esc(t.id)}">
+    <div class="typerow">
+    <div class="field"><label for="t-name-${i}">Nome do lote / setor <span class="note">(${stLabel[lotState(t)]})</span></label><input id="t-name-${i}" name="name" required value="${esc(t.name)}"></div>
     <div class="field"><label for="t-price-${i}">Preço inteira (R$)</label><input id="t-price-${i}" name="price" type="number" min="0" step="0.01" required value="${esc(t.price)}"></div>
     <div class="field"><label for="t-cap-${i}">Quantidade (vendidos: ${num(t.sold)})</label><input id="t-cap-${i}" name="capacity" type="number" min="${t.sold}" step="1" required value="${esc(t.capacity)}"></div>
     <label class="check" style="padding-bottom:9px"><input type="checkbox" name="allows_half" ${t.allows_half ? 'checked' : ''}> Meia</label>
     <div class="row" style="padding-bottom:2px"><button class="btn small" type="submit">Salvar</button>${t.sold ? '' : `<button class="btn small danger" type="button" data-act="del" data-id="${esc(t.id)}" aria-label="Excluir lote">Excluir</button>`}</div>
+    </div>${extra(t, 't' + i)}
   </form>`;
-  const read = fd => ({ name: String(fd.get('name')).trim(), price: Number(fd.get('price')) || 0, capacity: Math.max(0, Math.floor(Number(fd.get('capacity')) || 0)), allows_half: fd.get('allows_half') === 'on' });
+  const read = fd => {
+    const start = fromLocalInput(String(fd.get('sales_start') || '')), end = fromLocalInput(String(fd.get('sales_end') || ''));
+    if (start && end && new Date(end) <= new Date(start)) throw new Error('O fim das vendas precisa ser depois do início.');
+    return { name: String(fd.get('name')).trim(), price: Number(fd.get('price')) || 0, capacity: Math.max(0, Math.floor(Number(fd.get('capacity')) || 0)),
+             allows_half: fd.get('allows_half') === 'on', sales_start: start, sales_end: end, show_remaining: fd.get('show_remaining') === 'on' };
+  };
   mount(header + `<div class="panel">
-    <div><h2>Lotes e setores</h2><p class="note">A meia-entrada custa metade da inteira e usa a mesma quantidade do lote. Lotes com vendas não podem ser excluídos; diminua a quantidade até o total vendido para encerrar.</p></div>
+    <div><h2>Lotes e setores</h2><p class="note">A meia-entrada custa metade da inteira e usa a mesma quantidade do lote. Cada lote para de vender no que vier primeiro: acabar a quantidade ou passar o fim do período. Por padrão, o comprador não vê quantos ingressos restam. Lotes com vendas não podem ser excluídos; diminua a quantidade até o total vendido para encerrar.</p></div>
     <div>${types.length ? types.map(row).join('') : '<p class="note">Nenhum lote ainda.</p>'}</div>
   </div>
   <form class="panel" data-form="new"><h2>Novo lote</h2>
@@ -824,6 +862,7 @@ function mLotes(ev, header, reload) {
       <label class="check" style="padding-bottom:9px"><input type="checkbox" name="allows_half" checked> Meia</label>
       <div style="padding-bottom:2px"><button class="btn primary small" type="submit">Adicionar</button></div>
     </div>
+    ${extra(null, 'nt')}
   </form>`, {
     del: async b => {
       const { error } = await sb.from('ticket_types').delete().eq('id', b.dataset.id);

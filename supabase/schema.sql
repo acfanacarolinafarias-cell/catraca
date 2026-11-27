@@ -97,6 +97,15 @@ create table if not exists public.ticket_types (
   constraint ticket_types_sold_le_capacity check (sold <= capacity)
 );
 create index if not exists ticket_types_event_idx on public.ticket_types (event_id);
+-- Período de vendas do lote (opcional) e se o comprador vê quantos ingressos restam (padrão: não vê).
+-- O lote para de vender no que vier primeiro: acabar a quantidade ou passar o fim do período.
+alter table public.ticket_types add column if not exists sales_start    timestamptz;
+alter table public.ticket_types add column if not exists sales_end      timestamptz;
+alter table public.ticket_types add column if not exists show_remaining boolean not null default false;
+do $$ begin
+  alter table public.ticket_types add constraint ticket_types_sales_window_check
+    check (sales_start is null or sales_end is null or sales_end > sales_start);
+exception when duplicate_object then null; end $$;
 
 create table if not exists public.orders (
   id           uuid primary key default gen_random_uuid(),
@@ -633,8 +642,21 @@ begin
     if r.qty is null or r.qty < 1 or r.qty > 10 then
       raise exception 'Escolha entre 1 e 10 ingressos por lote.';
     end if;
+    if v_type.sales_start is not null and now() < v_type.sales_start then
+      raise exception 'As vendas de "%" começam em %.', v_type.name,
+        to_char(v_type.sales_start at time zone 'America/Sao_Paulo', 'DD/MM/YYYY "às" HH24:MI');
+    end if;
+    if v_type.sales_end is not null and now() > v_type.sales_end then
+      raise exception 'As vendas de "%" foram encerradas.', v_type.name;
+    end if;
     if v_type.sold + r.qty > v_type.capacity then
-      raise exception 'Não há ingressos suficientes em "%". Restam %.', v_type.name, v_type.capacity - v_type.sold;
+      if v_type.sold >= v_type.capacity then
+        raise exception '"%" esgotou.', v_type.name;
+      elsif v_type.show_remaining then
+        raise exception 'Não há ingressos suficientes em "%". Restam %.', v_type.name, v_type.capacity - v_type.sold;
+      else
+        raise exception 'Não há ingressos suficientes em "%" para essa quantidade.', v_type.name;
+      end if;
     end if;
     update public.ticket_types set sold = sold + r.qty where id = v_type.id;
   end loop;
@@ -884,7 +906,19 @@ create policy events_delete on public.events for delete
 
 drop policy if exists ticket_types_select on public.ticket_types;
 create policy ticket_types_select on public.ticket_types for select
-  using (exists (select 1 from public.events e where e.id = event_id));
+  using (public.can_manage_event(event_id) or public.is_event_staff(event_id));
+
+-- Lotes para o público: sem quantidade e vendidos, a não ser que o organizador escolha mostrar.
+-- A visão roda com as permissões do dono (por isso repete aqui a regra de evento publicado).
+create or replace view public.ticket_types_public with (security_barrier = true) as
+  select t.id, t.event_id, t.name, t.price, t.allows_half, t.sort,
+         t.sales_start, t.sales_end, t.show_remaining,
+         case when t.show_remaining then t.capacity end as capacity,
+         case when t.show_remaining then t.sold end     as sold,
+         (t.sold >= t.capacity)                         as sold_out
+  from public.ticket_types t
+  join public.events e on e.id = t.event_id
+  where e.published or public.can_manage_event(e.id) or public.is_event_staff(e.id);
 drop policy if exists ticket_types_write on public.ticket_types;
 create policy ticket_types_write on public.ticket_types for all
   using (public.can_manage_event(event_id)) with check (public.can_manage_event(event_id));
@@ -948,6 +982,7 @@ revoke all on public.profiles, public.organizers, public.events, public.ticket_t
               public.staff, public.staff_events, public.settings, public.coupons from anon, authenticated;
 
 grant select on public.events, public.ticket_types to anon, authenticated;
+grant select on public.ticket_types_public to anon, authenticated;
 grant select, update (full_name) on public.profiles to authenticated;
 grant select, insert, update, delete on public.organizers to authenticated;
 grant insert, update, delete on public.events to authenticated;
@@ -956,8 +991,8 @@ grant update (default_fee_pct, default_platform_type, default_platform_pct, defa
               payments_enabled, reservation_minutes, pix_fee_fixed, pix_fee_pct, card_fee_fixed, card_fee_pct,
               split_fee_fixed, card_fee_pct_2_6, card_fee_pct_7_12)
   on public.settings to authenticated;
-grant insert (id, event_id, name, price, capacity, allows_half, sort),
-      update (name, price, capacity, allows_half, sort),
+grant insert (id, event_id, name, price, capacity, allows_half, sort, sales_start, sales_end, show_remaining),
+      update (name, price, capacity, allows_half, sort, sales_start, sales_end, show_remaining),
       delete on public.ticket_types to authenticated;
 grant select on public.orders, public.tickets to authenticated;
 grant select, insert, update, delete on public.expenses to authenticated;
